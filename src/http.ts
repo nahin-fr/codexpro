@@ -1455,6 +1455,10 @@ async function main(): Promise<void> {
   }
 
   const app = express();
+  // Behind a reverse proxy/tunnel (cloudflared), key the failed-auth throttle per real client.
+  // CODEXPRO_TRUST_PROXY: a hop count (e.g. 1), or "loopback". Unset = trust nothing.
+  const trustProxy = process.env.CODEXPRO_TRUST_PROXY?.trim();
+  if (trustProxy) app.set("trust proxy", /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
   const connectionDiagnostics = {
     server_started_at: new Date().toISOString(),
