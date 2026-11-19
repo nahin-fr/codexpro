@@ -346,3 +346,21 @@ codexpro settings delete --yes
 ```
 
 Saved tokens are redacted when profiles are displayed.
+
+## How does CodexPro handle long-running commands (e.g. Next.js builds, tests, migrations)?
+
+CodexPro runs shell commands via the `bash` MCP tool with the following safeguards:
+
+1. **Timeout Configuration:**
+   - Default timeout: 600,000 ms (10 minutes).
+   - Maximum timeout: 1,800,000 ms (30 minutes).
+   - Tools can request a custom `timeout_ms` (e.g., `{ command: "npm run build", timeout_ms: 180000 }`).
+
+2. **Cloudflare & Client Keepalives:**
+   - Public Cloudflare tunnels enforce a **120-second Proxy Read Timeout** (`HTTP 524`) on idle HTTP connections.
+   - When the caller supplies a progress token, CodexPro emits MCP progress notifications every 15 seconds, including through the `codexpro` wrapper. Clients must opt into resetting their timeout on progress; this does not override ChatGPT's own caller deadline.
+   - A caller timeout does not establish whether a remote command succeeded. Reconcile remote process and image state before retrying a rebuild or deploy.
+
+3. **Process Group Detachment & Clean Termination:**
+   - Shell commands execute in a dedicated Unix process group (`detached: true`).
+   - If a command exceeds its timeout or the client aborts the request, CodexPro terminates the entire process group (`process.kill(-child.pid)` with `SIGTERM` followed by `SIGKILL`). This prevents compiler or build worker subprocesses (e.g., Next.js or Node workers) from becoming orphaned under PID 1 (`launchd`) and holding file locks or consuming memory.

@@ -216,7 +216,7 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
   }
 }
 
-type CodexToolHandler = (args: any) => Promise<any> | any;
+type CodexToolHandler = (args: any, extra?: any) => Promise<any> | any;
 
 const SUPERTOOL_NAME = "codexpro";
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
@@ -275,12 +275,12 @@ function registerToolCompat(
   server: McpServer,
   name: string,
   options: Record<string, unknown>,
-  handler: (args: any) => Promise<any> | any
+  handler: (args: any, extra?: any) => Promise<any> | any
 ): void {
-  const wrapped = async (args: any) => {
+  const wrapped = async (args: any, extra?: any) => {
     const started = Date.now();
     try {
-      const result = tagToolResult(await handler(args ?? {}), name, options);
+      const result = tagToolResult(await handler(args ?? {}, extra), name, options);
       logToolCall(name, result?.isError ? "error" : "ok", started);
       return result;
     } catch (error) {
@@ -426,17 +426,17 @@ function toolNamesForMode(config: CodexProConfig): string[] {
 const MINIMAL_TOOLS = new Set<string>(MINIMAL_TOOL_NAMES);
 const STANDARD_TOOLS = new Set<string>(STANDARD_TOOL_NAMES);
 const GUARDED_GIT_TOOL_NAMES = new Set(["git_current_state", "git_create_branch", "git_switch_branch", "git_stage_paths", "git_unstage_paths", "git_commit", "git_push_current_branch", "github_create_pull_request"]);
-const registeredToolNamesByServer = new WeakMap<object, string[]>();
+const registeredToolsByServer = new WeakMap<object, Set<string>>();
 
 function rememberRegisteredTool(server: McpServer, name: string): void {
   const key = server as object;
-  const names = registeredToolNamesByServer.get(key) ?? [];
-  if (!registeredToolNamesByServer.has(key)) registeredToolNamesByServer.set(key, names);
-  if (!names.includes(name)) names.push(name);
+  const set = registeredToolsByServer.get(key) ?? new Set<string>();
+  set.add(name);
+  registeredToolsByServer.set(key, set);
 }
 
 function registeredToolNames(server: McpServer): string[] {
-  return [...(registeredToolNamesByServer.get(server as object) ?? [])];
+  return Array.from(registeredToolsByServer.get(server as object) ?? []);
 }
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
@@ -461,7 +461,7 @@ function registerCodexTool(
   handler: CodexToolHandler
 ): void {
   if (!shouldRegisterTool(config, name)) return;
-  const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
+  const validatedHandler: CodexToolHandler = (args, extra) => handler(validateToolArgs(name, options, args), extra);
   registerToolCompat(server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
   rememberRegisteredToolHandler(server, name, validatedHandler);
@@ -940,7 +940,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   const workspaces = getSharedWorkspaceManager(config);
   const guard = new PathGuard(config);
   const server = new McpServer({ name: "CodexPro", version: "0.29.0" }, { instructions: serverInstructions(config) });
-  registeredToolNamesByServer.set(server as object, []);
+  registeredToolsByServer.set(server as object, new Set<string>());
   registerToolCardResource(server, config);
 
   registerCodexTool(
@@ -962,7 +962,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         "openai/toolInvocation/invoked": "CodexPro supertool action complete"
       }
     },
-    async (args) => {
+    async (args, extra) => {
       const action = normalizeSupertoolAction(args.action);
       const names = registeredToolNames(server).filter((name) => name !== SUPERTOOL_NAME);
       if (action === "list_actions" || action === "help") {
@@ -1009,7 +1009,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
           : {};
       let result: any;
       try {
-        result = await handler(childArgs);
+        result = await handler(childArgs, extra);
       } catch (error) {
         result = errorResult(error);
       }
@@ -1931,7 +1931,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         command: z.string().describe("Command to run."),
         session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id. If configured on the server, a provided value must match it."),
         cwd: z.string().optional().describe("Working directory relative to workspace root. Default: ."),
-        timeout_ms: z.number().int().min(1000).max(180000).optional().describe("Timeout in milliseconds. Default: 30000.")
+        timeout_ms: z.number().int().min(1000).max(1800000).optional().describe("Timeout in milliseconds. Default: 600000. Max: 1800000. Client timeouts may be shorter; reconcile remote state before retrying a timed-out command.")
       },
       annotations: BASH_ANNOTATIONS,
       _meta: {
@@ -1940,12 +1940,28 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         "openai/toolInvocation/invoked": "Bash command finished"
       }
     },
-    async (args) => {
+    async (args, extra) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      const onHeartbeat = (elapsedMs: number) => {
+        try {
+          if (extra?.sendNotification && extra._meta?.progressToken !== undefined) {
+            extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken: extra._meta.progressToken,
+                progress: Math.round(elapsedMs / 1000),
+                total: Math.round((args.timeout_ms ?? 600000) / 1000)
+              }
+            }).catch(() => {});
+          }
+        } catch {}
+      };
       const result = await runBash(config, guard, workspace, String(args.command ?? ""), {
         cwd: args.cwd,
         timeoutMs: args.timeout_ms,
-        sessionId: args.session_id
+        sessionId: args.session_id,
+        signal: extra?.signal,
+        onHeartbeat
       });
       const text = bashTextResult(config, result);
       return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });

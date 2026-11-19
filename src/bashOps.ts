@@ -205,49 +205,106 @@ export async function runBash(
   guard: PathGuard,
   workspace: Workspace,
   command: string,
-  options: { cwd?: string; timeoutMs?: number; sessionId?: string } = {}
+  options: {
+    cwd?: string;
+    timeoutMs?: number;
+    sessionId?: string;
+    signal?: AbortSignal;
+    onHeartbeat?: (elapsedMs: number) => void;
+  } = {}
 ): Promise<BashResult> {
   if (!command?.trim()) throw new CodexProError("command is required.");
   const bashSessionId = assertBashSession(config, options.sessionId);
   assertSafeCommand(config, command);
   const cwdResolved = guard.resolve(workspace, options.cwd ?? ".");
   const cwd = cwdResolved.absPath;
-  const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 30_000, 180_000));
+  const maxTimeoutMs = 1_800_000;
+  const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 600_000, maxTimeoutMs));
   const start = Date.now();
+
+  if (options.signal?.aborted) {
+    throw new CodexProError("Command aborted before execution started.");
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(bashExecutable(), ["-lc", command], {
       cwd,
       env: makeEnv(config),
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32"
     });
 
     let stdout = "";
     let stderr = "";
     let killedByTimeout = false;
+    let killedByAbort = false;
+
+    const killProcessTree = (sig: NodeJS.Signals = "SIGTERM") => {
+      try {
+        if (child.pid && process.platform !== "win32") {
+          process.kill(-child.pid, sig);
+        } else {
+          child.kill(sig);
+        }
+      } catch {}
+    };
 
     const timer = setTimeout(() => {
       killedByTimeout = true;
-      child.kill("SIGTERM");
+      killProcessTree("SIGTERM");
       setTimeout(() => {
-        if (!child.killed) child.kill("SIGKILL");
+        if (!child.killed) killProcessTree("SIGKILL");
       }, 1_500).unref();
     }, timeoutMs);
     timer.unref();
 
+    let heartbeatTimer: NodeJS.Timeout | undefined;
+    if (options.onHeartbeat) {
+      heartbeatTimer = setInterval(() => {
+        options.onHeartbeat?.(Date.now() - start);
+      }, 15_000);
+      heartbeatTimer.unref();
+    }
+
+    const abortHandler = () => {
+      killedByAbort = true;
+      killProcessTree("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) killProcessTree("SIGKILL");
+      }, 1_500).unref();
+    };
+
+    if (options.signal) {
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
     child.stdout.on("data", (chunk) => {
       stdout += String(chunk);
-      if (Buffer.byteLength(stdout, "utf8") > config.maxOutputBytes * 2) child.kill("SIGTERM");
+      if (Buffer.byteLength(stdout, "utf8") > config.maxOutputBytes * 2) killProcessTree("SIGTERM");
     });
     child.stderr.on("data", (chunk) => {
       stderr += String(chunk);
-      if (Buffer.byteLength(stderr, "utf8") > config.maxOutputBytes * 2) child.kill("SIGTERM");
+      if (Buffer.byteLength(stderr, "utf8") > config.maxOutputBytes * 2) killProcessTree("SIGTERM");
     });
-    child.on("error", reject);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (options.signal) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
+      reject(err);
+    });
     child.on("close", (exitCode, signal) => {
       clearTimeout(timer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (options.signal) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
       if (killedByTimeout) {
         stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
+      }
+      if (killedByAbort) {
+        stderr += `\n[codexpro] Command cancelled by client abort.`;
       }
       const out = trimOutput(redactSensitiveText(stdout), config.maxOutputBytes);
       const err = trimOutput(redactSensitiveText(stderr), config.maxOutputBytes);
