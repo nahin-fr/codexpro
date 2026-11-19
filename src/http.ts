@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
-import cors from "cors";
 import { z } from "zod";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -20,6 +19,9 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
+import { WorkspaceRegistry } from "./guard.js";
+import { redactConfigPaths } from "./pathLabels.js";
+import { CODEXPRO_VERSION } from "./version.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -374,6 +376,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
     toolMode: next.toolMode,
     toolCards: next.toolCards,
     ...(next.widgetDomain ? { widgetDomain: next.widgetDomain } : {}),
+    ...(existing.allowedRoots?.length ? { allowedRoots: existing.allowedRoots } : {}),
     ...(next.noInstallCloudflared ? { noInstallCloudflared: true } : {})
   };
 }
@@ -381,7 +384,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
 function profileResponse(config: CodexProConfig): Record<string, unknown> {
   const profile = readWorkspaceProfile(config.defaultRoot);
   const runtime = readRuntimeConnection(config.defaultRoot);
-  return redactStructured({
+  return redactConfigPaths(config, redactStructured({
     ok: true,
     profile_path: profile.profilePath ?? profilePathForRoot(config.defaultRoot),
     exists: Boolean(profile.profilePath),
@@ -400,7 +403,7 @@ function profileResponse(config: CodexProConfig): Record<string, unknown> {
       widgetDomain: config.widgetDomain,
       authEnabled: Boolean(config.authToken)
     }
-  });
+  }), { labelUnknownPaths: true });
 }
 
 function jsonError(res: Response, status: number, code: string, message: string, issues?: unknown): void {
@@ -415,8 +418,6 @@ const LOCAL_FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 6
   <rect x="8" y="8" width="48" height="48" rx="12" fill="#ffffff" fill-opacity=".12" stroke="#ffffff" stroke-opacity=".38"/>
   <path d="M38.4 40.3c-1.8 1.1-3.9 1.7-6.3 1.7-6.1 0-10.3-4.2-10.3-10s4.2-10 10.4-10c2.4 0 4.5.6 6.2 1.7l-2.1 4.1c-1.1-.7-2.3-1-3.8-1-2.9 0-4.9 2.1-4.9 5.2s2 5.2 4.9 5.2c1.5 0 2.8-.4 3.9-1.1l2 4.2Z" fill="#ffffff"/>
 </svg>`;
-const CODEXPRO_VERSION = "0.29.0";
-
 function printHelp(): void {
   console.log(`CodexPro MCP HTTP server
 
@@ -1248,7 +1249,7 @@ function onboardingPage(config: CodexProConfig): string {
           <div class="guide-list">
             <div class="guide-item"><span class="num">1</span><span><strong>Review the profile</strong><p>Choose the tunnel, port, mode, bash, write, tool, Codex session, and workspace defaults for the next launch.</p></span></div>
             <div class="guide-item"><span class="num">2</span><span><strong>Copy the Server URL</strong><p>Use the current public URL shown in the profile when available, or the one printed by the terminal after launch.</p></span></div>
-            <div class="guide-item"><span class="num">3</span><span><strong>Create the ChatGPT app</strong><p>Choose Server URL, paste the copied URL, and use no extra authentication. The private token is already in the URL.</p></span></div>
+            <div class="guide-item"><span class="num">3</span><span><strong>Create a personal ChatGPT app</strong><p>Choose Server URL, paste the copied URL, and use no extra authentication. This private URL is for one user's connector, not a shared deployment.</p></span></div>
             <div class="guide-item"><span class="num">4</span><span><strong>Restart for policy changes</strong><p>Saved profile changes apply when CodexPro starts again. The live server does not mutate under an active ChatGPT session.</p></span></div>
           </div>
         </section>
@@ -1281,7 +1282,7 @@ function onboardingPage(config: CodexProConfig): string {
           <li><span class="num">1</span><span>Open ChatGPT settings and create an app connection.</span></li>
           <li><span class="num">2</span><span>Set Connection to <code>Server URL</code>.</span></li>
           <li><span class="num">3</span><span>Paste the public CodexPro URL from the terminal.</span></li>
-          <li><span class="num">4</span><span>Use <code>No Authentication / None</code>; the private token is already in the copied URL.</span></li>
+          <li><span class="num">4</span><span>For a personal connector, use <code>No Authentication / None</code>; the private token is already in the copied URL. Shared production access requires OAuth or an Authorization header.</span></li>
         </ol>
         <p class="note"><a class="action-link" href="${chatgptUrl}" target="_blank" rel="noreferrer">Open ChatGPT settings</a></p>
       </section>
@@ -1314,19 +1315,24 @@ function onboardingPage(config: CodexProConfig): string {
     <footer class="foot">Token-protected local control surface for this workspace. Public sharing still happens only through your chosen tunnel.</footer>
   </main>
   <script>
+    const initialUrl = new URL(window.location.href);
+    const connectorToken = initialUrl.searchParams.get("codexpro_token") || initialUrl.searchParams.get("token") || "";
+    if (connectorToken) {
+      initialUrl.searchParams.delete("codexpro_token");
+      initialUrl.searchParams.delete("token");
+      const cleanSearch = initialUrl.searchParams.toString();
+      history.replaceState(null, "", initialUrl.pathname + (cleanSearch ? "?" + cleanSearch : "") + initialUrl.hash);
+    }
+    const adminProfileUrl = "/admin/profile" + (connectorToken ? "?codexpro_token=" + encodeURIComponent(connectorToken) : "");
     document.querySelectorAll("[data-copy], [data-copy-kind]").forEach((button) => {
       button.addEventListener("click", async () => {
         let value = button.getAttribute("data-copy") || "";
         if (button.getAttribute("data-copy-kind") === "local-mcp") {
           const base = button.getAttribute("data-copy-base") || value;
-          const params = new URLSearchParams(window.location.search);
-          const token = params.get("codexpro_token") || params.get("token") || "";
-          value = token ? base + "?codexpro_token=" + encodeURIComponent(token) : base;
+          value = connectorToken ? base + "?codexpro_token=" + encodeURIComponent(connectorToken) : base;
         } else if (button.getAttribute("data-copy-kind") === "server-url") {
           const base = button.getAttribute("data-copy-base") || value;
-          const params = new URLSearchParams(window.location.search);
-          const token = params.get("codexpro_token") || params.get("token") || "";
-          value = token ? base + "?codexpro_token=" + encodeURIComponent(token) : base;
+          value = connectorToken ? base + "?codexpro_token=" + encodeURIComponent(connectorToken) : base;
         }
         try {
           await navigator.clipboard.writeText(value);
@@ -1410,7 +1416,7 @@ function onboardingPage(config: CodexProConfig): string {
         };
         if (status) status.textContent = "Saving...";
         try {
-          const response = await fetch("/admin/profile" + window.location.search, {
+          const response = await fetch(adminProfileUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload)
@@ -1450,6 +1456,22 @@ async function main(): Promise<void> {
 
   const app = express();
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
+  const connectionDiagnostics = {
+    server_started_at: new Date().toISOString(),
+    requests_received: 0,
+    auth_failures: 0,
+    mcp_requests_received: 0,
+    mcp_dispatches_started: 0,
+    mcp_responses_completed: 0,
+    mcp_errors: 0,
+    last_request_at: null as string | null,
+    last_mcp_request_at: null as string | null,
+    last_dispatch_started_at: null as string | null,
+    last_response_completed_at: null as string | null,
+    last_auth_failure_at: null as string | null
+  };
+  const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
+  const authFailureLimit = 10;
 
   function tokenMatches(value: unknown): boolean {
     if (!config.authToken || typeof value !== "string") return false;
@@ -1486,22 +1508,68 @@ async function main(): Promise<void> {
     next();
   }
 
+  function sameOriginAdminRequest(req: Request, res: Response, next: NextFunction): void {
+    const origin = req.headers.origin;
+    if (!origin) {
+      next();
+      return;
+    }
+    const host = req.get("host");
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      jsonError(res, 403, "origin_denied", "Cross-origin admin requests are not allowed.");
+      return;
+    }
+    // A tunnel may terminate TLS before forwarding to this HTTP process, so compare the
+    // browser Origin host with the forwarded Host instead of requiring matching schemes.
+    if (!host || originHost !== host) {
+      jsonError(res, 403, "origin_denied", "Cross-origin admin requests are not allowed.");
+      return;
+    }
+    next();
+  }
+
   app.use((req, res, next) => {
+    const requestTime = new Date().toISOString();
+    const incomingRequestId = Array.isArray(req.headers["x-codexpro-request-id"])
+      ? req.headers["x-codexpro-request-id"][0]
+      : req.headers["x-codexpro-request-id"];
+    const requestId = typeof incomingRequestId === "string" && /^[A-Za-z0-9._:-]{1,96}$/.test(incomingRequestId)
+      ? incomingRequestId
+      : randomUUID();
+    (req as Request & { codexproRequestId?: string }).codexproRequestId = requestId;
+    res.setHeader("X-CodexPro-Request-Id", requestId);
+    connectionDiagnostics.requests_received += 1;
+    connectionDiagnostics.last_request_at = requestTime;
+    if (req.path === "/mcp") {
+      connectionDiagnostics.mcp_requests_received += 1;
+      connectionDiagnostics.last_mcp_request_at = requestTime;
+    }
     if (!logRequests) {
       next();
       return;
     }
     const started = Date.now();
-    console.error(`[CodexPro] ${req.method} ${req.path} received`);
+    console.error(`[CodexPro] ${req.method} ${req.path} received request_id=${requestId}`);
     res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms request_id=${requestId}`);
     });
     next();
   });
-  app.use(cors({ exposedHeaders: ["Mcp-Session-Id"] }));
   app.get("/favicon.ico", (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.type("image/svg+xml").send(LOCAL_FAVICON);
+  });
+  app.use((_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    next();
   });
   app.use((req, res, next) => {
     if (!config.authToken) {
@@ -1514,11 +1582,37 @@ async function main(): Promise<void> {
       : typeof req.query.token === "string"
         ? req.query.token
         : undefined;
-    if (!tokenMatches(bearer) && !tokenMatches(queryToken)) {
+    if (tokenMatches(bearer) || tokenMatches(queryToken)) {
+      next();
+      return;
+    }
+
+    const now = Date.now();
+    const key = req.ip || req.socket.remoteAddress || "local";
+    const current = authFailureWindow.get(key);
+    if (!current || current.resetAt <= now) {
+      authFailureWindow.set(key, { count: 1, resetAt: now + 60_000 });
+      connectionDiagnostics.auth_failures += 1;
+      connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
       res.status(401).send("Unauthorized");
       return;
     }
-    next();
+    current.count += 1;
+    if (authFailureWindow.size > 4096) {
+      for (const [candidate, record] of authFailureWindow) {
+        if (record.resetAt <= now) authFailureWindow.delete(candidate);
+      }
+    }
+    if (current.count > authFailureLimit) {
+      connectionDiagnostics.auth_failures += 1;
+      connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((current.resetAt - now) / 1000))));
+      res.status(429).send("Too Many Authentication Attempts");
+      return;
+    }
+    connectionDiagnostics.auth_failures += 1;
+    connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
+    res.status(401).send("Unauthorized");
   });
 
   type TransportRecord = {
@@ -1528,6 +1622,7 @@ async function main(): Promise<void> {
   };
 
   const transports = new Map<string, TransportRecord>();
+  const workspaceRegistry = new WorkspaceRegistry();
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   function requestSessionId(req: Request): string | undefined {
@@ -1590,7 +1685,7 @@ async function main(): Promise<void> {
   });
 
   app.get("/healthz", (_req, res) => {
-    res.json({
+    res.json(redactConfigPaths(config, {
       ok: true,
       name: "CodexPro",
       defaultRoot: config.defaultRoot,
@@ -1605,15 +1700,16 @@ async function main(): Promise<void> {
       widgetDomain: config.widgetDomain,
       contextDir: config.contextDir,
       authEnabled: Boolean(config.authToken),
-      authRequired: Boolean(config.authToken)
-    });
+      authRequired: Boolean(config.authToken),
+      connection_diagnostics: connectionDiagnostics
+    }, { labelUnknownPaths: true }));
   });
 
   app.get("/admin/profile", (_req, res) => {
     res.json(profileResponse(config));
   });
 
-  app.post("/admin/profile", adminRateLimit, adminBodyLimit, express.json({ limit: "32kb" }), (req, res) => {
+  app.post("/admin/profile", sameOriginAdminRequest, adminRateLimit, adminBodyLimit, express.json({ limit: "32kb" }), (req, res) => {
     const parsed = AdminProfilePatch.safeParse(req.body ?? {});
     if (!parsed.success) {
       jsonError(res, 400, "invalid_profile", "Invalid profile settings.", parsed.error.flatten());
@@ -1639,6 +1735,8 @@ async function main(): Promise<void> {
   });
 
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    connectionDiagnostics.mcp_dispatches_started += 1;
+    connectionDiagnostics.last_dispatch_started_at = new Date().toISOString();
     try {
       const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
@@ -1665,7 +1763,7 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config);
+        const server = createCodexProServer(config, { workspaceRegistry });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1673,7 +1771,10 @@ async function main(): Promise<void> {
       }
 
       await transport.handleRequest(req, res, req.body);
+      connectionDiagnostics.mcp_responses_completed += 1;
+      connectionDiagnostics.last_response_completed_at = new Date().toISOString();
     } catch (error) {
+      connectionDiagnostics.mcp_errors += 1;
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
         res.status(500).json({

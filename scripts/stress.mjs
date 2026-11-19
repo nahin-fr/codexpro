@@ -2,6 +2,12 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
+
+const REQUEST_TIMEOUT_MS = process.platform === 'win32' ? 45_000 : 20_000;
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function assert(ok, message) {
   if (!ok) throw new Error(message);
@@ -28,7 +34,7 @@ class McpStdioClient {
         CODEXPRO_TOOL_MODE: env.CODEXPRO_TOOL_MODE ?? 'full',
         CODEXPRO_BASH_MODE: env.CODEXPRO_BASH_MODE ?? 'safe',
         CODEXPRO_MAX_SEARCH_RESULTS: '2000',
-        CODEXPRO_MAX_OUTPUT_BYTES: '2000000',
+        CODEXPRO_MAX_OUTPUT_BYTES: env.CODEXPRO_MAX_OUTPUT_BYTES ?? '2000000',
         CODEXPRO_TOOL_CARDS: env.CODEXPRO_TOOL_CARDS ?? '0'
       }
     });
@@ -68,7 +74,11 @@ class McpStdioClient {
     const id = this.nextId++;
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}\n${this.stderr}`)), 20000);
+      const operation = method === 'tools/call' && params?.name ? `${method}:${params.name}` : method;
+      const timer = setTimeout(
+        () => reject(new Error(`timeout waiting for ${operation} after ${REQUEST_TIMEOUT_MS} ms\n${this.stderr}`)),
+        REQUEST_TIMEOUT_MS
+      );
       timer.unref();
       this.pending.set(id, { resolve, reject, timer });
     });
@@ -107,7 +117,9 @@ async function makeFixture() {
   await fs.writeFile(path.join(root, 'AGENTS.md'), '# Stress Agents\n\nKeep checks local.\n', 'utf8');
   await fs.writeFile(path.join(root, 'demo.txt'), 'alpha\n--flag root\narrow -> value\n', 'utf8');
   await fs.writeFile(path.join(root, '.hidden.txt'), 'needle hidden\n', 'utf8');
-  await fs.writeFile(path.join(root, 'visible:123:file.txt'), 'needle colon path\n', 'utf8');
+  if (process.platform !== 'win32') {
+    await fs.writeFile(path.join(root, 'visible:123:file.txt'), 'needle colon path\n', 'utf8');
+  }
   await fs.mkdir(path.join(root, '.github', 'workflows'), { recursive: true });
   await fs.writeFile(path.join(root, '.github', 'workflows', 'ci.yml'), 'name: ci\n', 'utf8');
   await fs.mkdir(path.join(root, 'many'), { recursive: true });
@@ -207,11 +219,13 @@ async function runFullModeStress(root) {
     });
     assert(hiddenSearch.structuredContent.matches.some((match) => match.path === '.hidden.txt'), 'include_hidden search missed hidden file');
 
-    const colonSearch = await client.request('tools/call', {
-      name: 'search',
-      arguments: { workspace_id: ws, query: 'needle colon path', max_results: 10 }
-    });
-    assert(colonSearch.structuredContent.matches.some((match) => match.path === 'visible:123:file.txt' && match.line === 1), `colon path search parsed incorrectly: ${JSON.stringify(colonSearch.structuredContent.matches)}`);
+    if (process.platform !== 'win32') {
+      const colonSearch = await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: ws, query: 'needle colon path', max_results: 10 }
+      });
+      assert(colonSearch.structuredContent.matches.some((match) => match.path === 'visible:123:file.txt' && match.line === 1), `colon path search parsed incorrectly: ${JSON.stringify(colonSearch.structuredContent.matches)}`);
+    }
 
     const superRead = await client.request('tools/call', {
       name: 'codexpro',
@@ -408,7 +422,7 @@ async function runGlobalSkillStress(root) {
     assert(loadedByName.structuredContent.text.includes('# Global Only Skill'), 'load_skill did not load unique user skill by name');
   } finally {
     client?.close();
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
@@ -456,7 +470,10 @@ async function runMcpInventoryStress() {
   await fs.writeFile(path.join(fakeHome, '.codex', 'config.toml'), toml, 'utf8');
   await fs.writeFile(path.join(fakeHome, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: cursorServers }), 'utf8');
 
-  const client = await initClient(root, { HOME: fakeHome });
+  const client = await initClient(root, {
+    HOME: fakeHome,
+    ...(process.platform === 'win32' ? { USERPROFILE: fakeHome } : {})
+  });
   try {
     const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
     const inventory = await client.request('tools/call', {
@@ -589,8 +606,41 @@ async function runNodeFallbackSearchLimitStress() {
       arguments: { workspace_id: opened.structuredContent.workspace_id, query: 'needle', path: 'overflow.txt', max_results: 2 }
     });
     assert(overflow.structuredContent.matches.length === 2 && overflow.structuredContent.truncated === true, `node fallback overflow search did not report truncation: ${JSON.stringify(overflow.structuredContent)}`);
+    const regex = await client.request('tools/call', {
+      name: 'search',
+      arguments: { workspace_id: opened.structuredContent.workspace_id, query: '(a+)+$', regex: true, path: 'overflow.txt' }
+    });
+    assert(String(regex.structuredContent.error).toLowerCase().includes('regex search requires ripgrep'), `node fallback accepted regex search: ${JSON.stringify(regex.structuredContent)}`);
   } finally {
     client.close();
+  }
+}
+
+async function runBashOutputTerminationStress() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-bash-output-'));
+  const client = await initClient(root, {
+    CODEXPRO_BASH_MODE: 'full',
+    CODEXPRO_MAX_OUTPUT_BYTES: '4000'
+  });
+  try {
+    const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+    const started = Date.now();
+    const result = await client.request('tools/call', {
+      name: 'bash',
+      arguments: {
+        workspace_id: opened.structuredContent.workspace_id,
+        command: `${JSON.stringify(process.execPath)} -e "process.on('SIGTERM',()=>{}); setInterval(()=>process.stdout.write('x'.repeat(1024)),1)"`,
+        timeout_ms: 15000
+      }
+    });
+    const retainedBytes = Buffer.byteLength(result.structuredContent.stdout ?? '', 'utf8') +
+      Buffer.byteLength(result.structuredContent.stderr ?? '', 'utf8');
+    assert(Date.now() - started < 8000, `output-limited bash waited for the independent timeout: ${Date.now() - started} ms`);
+    assert(result.structuredContent.truncated === true, `output-limited bash did not report truncation: ${JSON.stringify(result.structuredContent)}`);
+    assert(retainedBytes < 9000, `output-limited bash retained too much output: ${retainedBytes} bytes`);
+  } finally {
+    client.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
@@ -814,7 +864,37 @@ async function runAnalysisBudgetStress() {
     assert(limitedOutput.structuredContent.warnings.some((warning) => warning.includes('Structured output was limited')), 'inspect output limit did not report a warning');
   } finally {
     client.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+}
+
+async function runBashHomeEnvStress() {
+  const { resolveUsableHomeDir, makeRestrictedBashEnv } = await import(pathToFileURL(path.join(repoRoot, 'dist', 'bashOps.js')).href);
+  const { loadConfig } = await import(pathToFileURL(path.join(repoRoot, 'dist', 'config.js')).href);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-bash-home-root-'));
+  const realHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-bash-home-'));
+  try {
+    const resolved = resolveUsableHomeDir({ HOME: '=', USERPROFILE: realHome });
+    assert(path.resolve(resolved) === path.resolve(realHome), `invalid HOME was not replaced: ${resolved}`);
+    const fallback = resolveUsableHomeDir({ HOME: '=' });
+    assert(path.isAbsolute(fallback) && fallback !== '=', `invalid HOME alone did not fall back: ${fallback}`);
+    const config = loadConfig(['--root', root, '--bash', 'full', '--write', 'off']);
+    assert(config.maxBashTimeoutMs === 600_000, `default bash timeout cap drifted: ${config.maxBashTimeoutMs}`);
+    const env = makeRestrictedBashEnv(config, {
+      HOME: '=',
+      USERPROFILE: realHome,
+      PATH: process.env.PATH,
+      APPDATA: path.join(realHome, 'AppData', 'Roaming'),
+      LOCALAPPDATA: path.join(realHome, 'AppData', 'Local')
+    });
+    assert(path.resolve(env.HOME) === path.resolve(realHome), `restricted env kept invalid HOME: ${env.HOME}`);
+    assert(!String(env.HOME).includes('='), `restricted HOME still looks relative: ${env.HOME}`);
+    if (process.platform === 'win32') {
+      assert(path.resolve(env.USERPROFILE) === path.resolve(realHome), `Windows USERPROFILE was wrong: ${env.USERPROFILE}`);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    await fs.rm(realHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
@@ -825,6 +905,8 @@ await runRedactionStress();
 await runMcpInventoryStress();
 await runMaxReadSearchStress();
 await runNodeFallbackSearchLimitStress();
+await runBashOutputTerminationStress();
+await runBashHomeEnvStress();
 await runGuardEdgeStress();
 await runSupertoolModeStress(root);
 await runShowChangesStatsStress();

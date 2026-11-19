@@ -8,6 +8,13 @@ import path from 'node:path';
 import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  CLOUDFLARED_VERSION,
+  cloudflaredReleaseAsset,
+  cloudflaredReleaseUrl,
+  readCloudflaredAssetResponse,
+  verifyCloudflaredAsset
+} from './cloudflared-release.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
@@ -50,7 +57,9 @@ Usage:
 Options:
   --root <dir>              Workspace root. Default: current directory.
   --from-root <dir>         Copy saved settings from another workspace with settings use.
-  --allow-root <dir>        Additional allowed root. Can be repeated.
+  --project <dir>           Additional allowed project. settings set saves it. Can be repeated.
+  --clear-projects          Remove saved additional projects with settings set.
+  --allow-root <dir>        Additional allowed root for this launch. Can be repeated.
   --allow-home              Allow opening any workspace under your home directory.
   --mode <agent|handoff|pro>
                              Default: agent.
@@ -67,6 +76,10 @@ Options:
   --bash-transcript <compact|full>
                              Chat transcript for bash results. Default: compact.
                              full prints raw stdout/stderr in chat.
+  --bash-runtime <auto|native-bash|wsl>
+                             Windows Bash runtime. auto prefers Git for Windows and never silently uses WSL.
+  --bash-executable <path>  Explicit bash.exe/wsl.exe path for the selected runtime.
+  --git-executable <path>   Explicit Git executable; otherwise native Git follows Git for Windows Bash when available.
   --full-bash-transcript    Shortcut for --bash-transcript full.
   --bash-session <id>       Local bash session label exposed to ChatGPT.
   --require-bash-session    Require bash calls to include matching session_id.
@@ -99,6 +112,7 @@ Options:
                              File containing a Cloudflare Tunnel token.
   --cloudflare-config <path> cloudflared YAML config for a named tunnel.
   --token <token>           Bearer token for HTTP MCP. Auto-generated for tunnels.
+  --token-file <path>       Read the HTTP MCP bearer token from a mode-0600 file.
   --cloudflared <path>      cloudflared executable. Default: PATH, then ~/.codexpro/bin.
   --ngrok <path>            ngrok executable. Default: PATH.
   --ngrok-config <path>     Optional ngrok config file path.
@@ -112,6 +126,7 @@ Options:
   --copy-url                Copy the ChatGPT Server URL to clipboard. Default for public HTTPS URLs.
   --no-copy-url             Do not copy the Server URL.
   --open-chatgpt            Open ChatGPT connector settings after the URL is ready.
+  --headless                Run without prompts, clipboard, browser opening, or the control panel.
   --no-auth                 Disable bearer-token auth. Only allowed with --tunnel none.
   --log-requests            Print redacted HTTP request and tool-call logs from the local MCP server.
   connection-test           Start a read-only connector with request logging and no bash or tool cards.
@@ -174,6 +189,8 @@ Workspace settings:
   codexpro settings show
   codexpro settings list
   codexpro settings set --tunnel ngrok --hostname your-domain.ngrok-free.dev
+  codexpro settings set --project /path/to/another/repo
+  codexpro settings set --clear-projects
   codexpro settings use
   codexpro settings delete --yes
 
@@ -327,10 +344,13 @@ function parseArgs(argv) {
     else if (key === 'stop-if-no-files-changed') out.stopIfNoFilesChanged = true;
     else if (key === 'stop-if-same-diff') out.stopIfSameDiff = true;
     else if (key === 'require-human-confirmation') out.requireHumanConfirmation = true;
+    else if (key === 'allow-remote-mutations') out.allowRemoteMutations = true;
     else if (key === 'allow-implicit-review-verdict') out.allowImplicitReviewVerdict = true;
     else if (key === 'allow-review-pass-on-failure') out.allowReviewPassOnFailure = true;
     else if (key === 'open-chatgpt') out.openChatgpt = true;
+    else if (key === 'headless') out.headless = true;
     else if (key === 'no-profile') out.noProfile = true;
+    else if (key === 'clear-projects') out.clearProjects = true;
     else if (key === 'save-config') out.saveConfig = true;
     else if (key === 'no-save-config') out.noSaveConfig = true;
     else if (key === 'yes' || key === 'force') out.yes = true;
@@ -355,7 +375,7 @@ function parseArgs(argv) {
       const value = inlineValue ?? next;
       if (value === undefined || (inlineValue === undefined && value.startsWith('--'))) throw new Error(`Missing value for --${key}`);
       if (inlineValue === undefined) i += 1;
-      if (key === 'allow-root') out.allowRoots.push(value);
+      if (key === 'allow-root' || key === 'project') out.allowRoots.push(value);
       else out[key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
     }
   }
@@ -487,7 +507,17 @@ function realDir(input) {
   if (!fs.existsSync(resolved)) throw new Error(`Directory does not exist: ${resolved}`);
   const stat = fs.statSync(resolved);
   if (!stat.isDirectory()) throw new Error(`Not a directory: ${resolved}`);
-  return fs.realpathSync(resolved);
+  return fs.realpathSync.native(resolved);
+}
+
+function configuredProjectRoots(root, args = {}, profile = {}) {
+  const saved = args.clearProjects
+    ? []
+    : Array.isArray(profile.allowedRoots)
+      ? profile.allowedRoots
+      : [];
+  const requested = Array.isArray(args.allowRoots) ? args.allowRoots : [];
+  return [...new Set([...saved, ...requested].map(realDir))].filter((projectRoot) => projectRoot !== root);
 }
 
 function resolveCodexDir(root, input) {
@@ -578,6 +608,11 @@ function resolveCodexCommand() {
   return commandPaths('codex').find(isWindowsCommandCandidate) || 'codex';
 }
 
+function resolveAgentCommand(command) {
+  if (process.platform !== 'win32' || isPathLike(command)) return command;
+  return commandPaths(command).find(isWindowsCommandCandidate) || command;
+}
+
 function executableFileExists(filePath) {
   try {
     return fs.statSync(filePath).isFile();
@@ -596,6 +631,70 @@ function commandAvailableFromRoot(command, root) {
   const expanded = expandHome(command);
   const resolved = path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(root, expanded);
   return executableFileExists(resolved);
+}
+
+function handoffRemoteMutationEnvironment(args) {
+  const env = { ...process.env, NO_COLOR: '1' };
+  if (args.allowRemoteMutations) {
+    env.CODEXPRO_REMOTE_MUTATIONS = 'allow';
+    return { env, mode: 'allowed', cleanup: () => {} };
+  }
+
+  const guardDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexpro-handoff-remote-guard-'));
+  const gitCommand = commandPaths('git')[0] || 'git';
+  const message = 'CodexPro blocked remote Git/GitHub mutation for this handoff. Re-run with --allow-remote-mutations only when that side effect is explicitly authorized.';
+  const gitGuardSource = `#!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
+const argv = process.argv.slice(2);
+let index = 0;
+const optionsWithValues = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env']);
+while (index < argv.length && argv[index].startsWith('-')) {
+  const option = argv[index];
+  index += optionsWithValues.has(option) && !option.includes('=') ? 2 : 1;
+}
+const command = argv[index] || '';
+const next = argv[index + 1] || '';
+const blocked = command === 'push' || command === 'send-pack' ||
+  ((command === 'lfs' || command === 'subtree') && next === 'push');
+if (blocked) {
+  console.error(${JSON.stringify(message)});
+  process.exit(126);
+}
+const result = spawnSync(${JSON.stringify(gitCommand)}, argv, { stdio: 'inherit', shell: false });
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(127);
+}
+process.exit(result.status ?? 1);
+`;
+  const ghGuardSource = `#!/usr/bin/env node
+console.error(${JSON.stringify(message)});
+process.exit(126);
+`;
+  const gitGuardPath = path.join(guardDir, process.platform === 'win32' ? 'git-guard.mjs' : 'git');
+  const ghGuardPath = path.join(guardDir, process.platform === 'win32' ? 'gh-guard.mjs' : 'gh');
+  fs.writeFileSync(gitGuardPath, gitGuardSource, { mode: 0o700 });
+  fs.writeFileSync(ghGuardPath, ghGuardSource, { mode: 0o700 });
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(guardDir, 'git.cmd'), `@"${process.execPath}" "${gitGuardPath}" %*\r\n`, { mode: 0o700 });
+    fs.writeFileSync(path.join(guardDir, 'gh.cmd'), `@"${process.execPath}" "${ghGuardPath}" %*\r\n`, { mode: 0o700 });
+  }
+  fs.mkdirSync(path.join(guardDir, 'gh-config'), { recursive: true, mode: 0o700 });
+
+  const inheritedPath = process.env.PATH ?? process.env.Path ?? '';
+  env.PATH = `${guardDir}${path.delimiter}${inheritedPath}`;
+  if (process.platform === 'win32') env.Path = env.PATH;
+  env.CODEXPRO_REMOTE_MUTATIONS = 'blocked_standard_cli';
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.GCM_INTERACTIVE = 'Never';
+  env.GH_CONFIG_DIR = path.join(guardDir, 'gh-config');
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[key];
+
+  return {
+    env,
+    mode: 'blocked_standard_cli',
+    cleanup: () => fs.rmSync(guardDir, { recursive: true, force: true })
+  };
 }
 
 function codexProHome() {
@@ -687,6 +786,7 @@ function saveRuntimeConnection(root, details, options = {}) {
     version: 1,
     root,
     pid: process.pid,
+    runtimePid: options.runtimePid ?? null,
     updatedAt: new Date().toISOString(),
     endpoint: details.endpoint,
     localBase: options.localBase ?? '',
@@ -733,6 +833,7 @@ function reusableProfilePayload(profile, overrides = {}) {
     root,
     updatedAt,
     profilePath,
+    allowedRoots,
     ...rest
   } = profile || {};
   return {
@@ -803,6 +904,20 @@ function bashTranscriptOption(args, profile = {}) {
   throw new Error('--bash-transcript must be compact or full.');
 }
 
+function bashRuntimeOption(args, profile = {}) {
+  const value = optionValue(args, profile, 'bashRuntime', ['CODEXPRO_BASH_RUNTIME'], 'auto');
+  if (value === 'auto' || value === 'native-bash' || value === 'wsl') return value;
+  throw new Error('--bash-runtime must be auto, native-bash, or wsl.');
+}
+
+function bashExecutableOption(args, profile = {}) {
+  return String(optionValue(args, profile, 'bashExecutable', ['CODEXPRO_BASH_EXECUTABLE'], '') || '').trim();
+}
+
+function gitExecutableOption(args, profile = {}) {
+  return String(optionValue(args, profile, 'gitExecutable', ['CODEXPRO_GIT_EXECUTABLE'], '') || '').trim();
+}
+
 function codexSessionsOption(args, profile = {}) {
   const value = optionValue(args, profile, 'codexSessions', ['CODEXPRO_CODEX_SESSIONS'], 'off');
   if (value === 'off' || value === 'metadata' || value === 'read') return value;
@@ -821,30 +936,6 @@ function localCloudflaredPath() {
   return path.join(codexProHome(), 'bin', cloudflaredBinName());
 }
 
-function cloudflaredReleaseAsset() {
-  const platform = process.platform;
-  const arch = process.arch;
-
-  if (platform === 'darwin') {
-    if (arch === 'arm64') return { file: 'cloudflared-darwin-arm64.tgz', archive: true };
-    if (arch === 'x64') return { file: 'cloudflared-darwin-amd64.tgz', archive: true };
-  }
-
-  if (platform === 'linux') {
-    if (arch === 'arm64') return { file: 'cloudflared-linux-arm64', archive: false };
-    if (arch === 'arm') return { file: 'cloudflared-linux-arm', archive: false };
-    if (arch === 'x64') return { file: 'cloudflared-linux-amd64', archive: false };
-    if (arch === 'ia32') return { file: 'cloudflared-linux-386', archive: false };
-  }
-
-  if (platform === 'win32') {
-    if (arch === 'x64') return { file: 'cloudflared-windows-amd64.exe', archive: false };
-    if (arch === 'ia32') return { file: 'cloudflared-windows-386.exe', archive: false };
-  }
-
-  throw new Error(`Automatic cloudflared install is not supported on ${platform}/${arch}. Install cloudflared manually or pass --cloudflared <path>.`);
-}
-
 function findFileByName(root, fileName) {
   const entries = fs.readdirSync(root, { withFileTypes: true });
   for (const entry of entries) {
@@ -858,21 +949,21 @@ function findFileByName(root, fileName) {
   return '';
 }
 
-async function downloadFile(url, destination) {
+async function downloadFile(url, destination, asset) {
   const response = await fetch(url, {
     headers: { 'user-agent': 'codexpro-launcher' }
   });
   if (!response.ok) {
     throw new Error(`Failed to download ${url}: ${response.status} ${response.statusText}`);
   }
-  const buffer = Buffer.from(await response.arrayBuffer());
+  const buffer = await readCloudflaredAssetResponse(response, asset);
+  verifyCloudflaredAsset(asset, buffer);
   fs.writeFileSync(destination, buffer, { mode: 0o755 });
 }
 
 function verifyCloudflared(binaryPath) {
-  const result = spawnSync(binaryPath, ['--version'], {
+  const result = spawnSyncPortable(binaryPath, ['--version'], {
     stdio: 'ignore',
-    shell: false,
     timeout: 15000
   });
   if (result.status !== 0) {
@@ -885,18 +976,18 @@ async function installCloudflaredLocal() {
   const installPath = localCloudflaredPath();
   const binDir = path.dirname(installPath);
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codexpro-cloudflared-'));
-  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${asset.file}`;
+  const url = cloudflaredReleaseUrl(asset);
 
   fs.mkdirSync(binDir, { recursive: true, mode: 0o700 });
   console.error(`[codexpro] Installing cloudflared locally: ${installPath}`);
-  console.error(`[codexpro] Downloading official Cloudflare release: ${asset.file}`);
+  console.error(`[codexpro] Downloading verified Cloudflare release ${CLOUDFLARED_VERSION}: ${asset.file}`);
 
   try {
     if (asset.archive) {
       const archivePath = path.join(tmpRoot, asset.file);
       const extractDir = path.join(tmpRoot, 'extract');
       fs.mkdirSync(extractDir, { recursive: true });
-      await downloadFile(url, archivePath);
+      await downloadFile(url, archivePath, asset);
       const tar = spawnSync('tar', ['-xzf', archivePath, '-C', extractDir], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -910,7 +1001,7 @@ async function installCloudflaredLocal() {
       fs.copyFileSync(extracted, installPath);
     } else {
       const tmpBinary = path.join(tmpRoot, cloudflaredBinName());
-      await downloadFile(url, tmpBinary);
+      await downloadFile(url, tmpBinary, asset);
       fs.copyFileSync(tmpBinary, installPath);
     }
 
@@ -959,9 +1050,8 @@ async function resolveCloudflared(args) {
 }
 
 function verifyNgrok(binaryPath) {
-  const result = spawnSync(binaryPath, ['version'], {
+  const result = spawnSyncPortable(binaryPath, ['version'], {
     stdio: 'ignore',
-    shell: false,
     timeout: 15000
   });
   if (result.status !== 0) {
@@ -989,9 +1079,8 @@ function resolveNgrok(args) {
 }
 
 function verifyTailscale(binaryPath) {
-  const result = spawnSync(binaryPath, ['version'], {
+  const result = spawnSyncPortable(binaryPath, ['version'], {
     stdio: 'ignore',
-    shell: false,
     timeout: 15000
   });
   if (result.status !== 0) {
@@ -1101,7 +1190,13 @@ const spawnedChildren = new Set();
 
 function spawnLogged(name, command, args, options = {}) {
   const { verbose = false, ...spawnOptions } = options;
-  const child = spawn(command, args, { ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'] });
+  const invocation = processInvocation(command, args);
+  const child = spawn(invocation.command, invocation.args, {
+    ...spawnOptions,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments
+  });
+  child.codexproKillTree = Boolean(invocation.killTree);
   const logLines = [];
   const record = (stream, chunk) => {
     const text = redactForLog(String(chunk));
@@ -1192,10 +1287,12 @@ function requestQuickTunnelViaCurl(proxyUrl) {
   const args = ['--silent', '--show-error', '--fail', '--max-time', '30'];
   if (proxyUrl) args.push('--proxy', proxyUrl);
   args.push('-X', 'POST', 'https://api.trycloudflare.com/tunnel');
-  const result = spawnSync('curl', args, {
+  const curlCommand = process.platform === 'win32'
+    ? commandPaths('curl').find(isWindowsCommandCandidate) || 'curl'
+    : 'curl';
+  const result = spawnSyncPortable(curlCommand, args, {
     encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    shell: false
+    stdio: ['ignore', 'pipe', 'pipe']
   });
   if (result.status !== 0) {
     throw new Error(redactForLog(`Failed to request Cloudflare quick tunnel via curl: ${result.stderr || result.stdout || `exit ${result.status}`}`));
@@ -1234,10 +1331,17 @@ function writeQuickTunnelCredentials(tunnel) {
 }
 
 function killProcess(child) {
-  if (!child || child.killed) return;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (child.codexproKillTree && child.pid) {
+    const result = spawnSync('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], {
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    if (!result.error && result.status === 0) return;
+  }
   try { child.kill('SIGTERM'); } catch {}
   setTimeout(() => {
-    if (!child.killed) {
+    if (child.exitCode === null && child.signalCode === null) {
       try { child.kill('SIGKILL'); } catch {}
     }
   }, 1500).unref();
@@ -1278,7 +1382,14 @@ function tailscaleFunnelHttpsPort(publicBase) {
 
 function readTokenFile(filePath) {
   const resolved = path.resolve(expandHome(filePath));
-  return fs.readFileSync(resolved, 'utf8').trim();
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) throw new Error(`Token path is not a regular file: ${resolved}`);
+  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+    throw new Error(`Token file permissions are too broad: ${resolved}. Run chmod 600 ${resolved}.`);
+  }
+  const token = fs.readFileSync(resolved, 'utf8').trim();
+  if (!token) throw new Error(`Token file is empty: ${resolved}`);
+  return token;
 }
 
 function normalizeMode(args) {
@@ -1353,6 +1464,19 @@ function resolveWorkspaceFile(root, relativePath) {
   const absPath = path.resolve(root, relativePath);
   if (!isSubpath(absPath, root)) {
     throw new Error(`Path escapes workspace root: ${relativePath}`);
+  }
+  const relative = path.relative(root, absPath);
+  let current = root;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) {
+        throw new Error(`Symlink paths are not allowed for local handoff files: ${relativePath}`);
+      }
+    } catch (error) {
+      if (error && typeof error === 'object' && error.code === 'ENOENT') break;
+      throw error;
+    }
   }
   return absPath;
 }
@@ -1487,16 +1611,22 @@ function buildExecutorCommand(args, root, planPath, planText) {
     const parts = splitCommandTemplate(template).map((part) => applyCommandTemplate(part, replacements));
     const displayParts = splitCommandTemplate(template).map((part) => applyCommandTemplate(part, { ...replacements, plan_text: '<plan_text>' }));
     if (!parts.length) throw new Error('Custom --command is empty.');
-    return { agent, model, command: parts[0], args: parts.slice(1), displayArgs: displayParts.slice(1), custom: true };
+    const command = resolveAgentCommand(parts[0]);
+    if (isWindowsBatchFile(command) && /\{\{\s*plan_text\s*\}\}/.test(template)) {
+      throw new Error('Windows .cmd/.bat adapters must use {{plan_file}} instead of {{plan_text}}.');
+    }
+    return { agent, model, command, args: parts.slice(1), displayArgs: displayParts.slice(1), custom: true };
   }
 
+  const relativePlanPath = path.relative(root, planPath) || planPath;
+  const planPrompt = `Read the handoff plan at ${relativePlanPath} and execute it in this workspace.`;
   if (agent === 'opencode') {
     return {
       agent,
       model,
-      command: 'opencode',
-      args: ['run', ...(model ? ['--model', model] : []), planText],
-      displayArgs: ['run', ...(model ? ['--model', model] : []), '<plan_text>'],
+      command: resolveAgentCommand('opencode'),
+      args: ['run', ...(model ? ['--model', model] : []), planPrompt],
+      displayArgs: ['run', ...(model ? ['--model', model] : []), `<read ${relativePlanPath}>`],
       custom: false
     };
   }
@@ -1504,15 +1634,14 @@ function buildExecutorCommand(args, root, planPath, planText) {
     return {
       agent,
       model,
-      command: 'pi',
-      args: [...(model ? ['--model', model] : []), '-p', planText],
-      displayArgs: [...(model ? ['--model', model] : []), '-p', '<plan_text>'],
+      command: resolveAgentCommand('pi'),
+      args: [...(model ? ['--model', model] : []), '-p', planPrompt],
+      displayArgs: [...(model ? ['--model', model] : []), '-p', `<read ${relativePlanPath}>`],
       custom: false
     };
   }
   if (agent === 'codex') {
     const codexLastMessagePath = path.join(path.dirname(planPath), 'codex-last-message.md');
-    const relativePlanPath = path.relative(root, planPath) || planPath;
     const codexPrompt = [
       `Read the handoff plan at ${relativePlanPath} and execute it in this workspace.`,
       'Keep changes scoped to that plan.',
@@ -1561,20 +1690,33 @@ function executorCommandPreview(commandInfo) {
 }
 
 function quoteWindowsCmdArg(value) {
-  const text = String(value).replace(/\r?\n/g, ' ');
+  const text = String(value).replace(/\r?\n/g, ' ').replace(/%/g, '%%');
   if (!text) return '""';
   return `"${text.replace(/"/g, '""')}"`;
 }
 
 function processInvocation(command, args) {
   if (!isWindowsBatchFile(command)) return { command, args };
-  const commandLine = ['call', quoteWindowsCmdArg(command), ...args.map(quoteWindowsCmdArg)].join(' ');
+  const commandLine = `"${[quoteWindowsCmdArg(command), ...args.map(quoteWindowsCmdArg)].join(' ')}"`;
   return {
     command: process.env.ComSpec || 'cmd.exe',
-    args: ['/d', '/s', '/c', commandLine],
-    windowsVerbatimArguments: true
+    args: ['/d', '/q', '/v:off', '/s', '/c', commandLine],
+    windowsVerbatimArguments: true,
+    killTree: true
   };
 }
+
+function spawnSyncPortable(command, args, options = {}) {
+  const invocation = processInvocation(command, args);
+  return spawnSync(invocation.command, invocation.args, {
+    ...options,
+    shell: false,
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments
+  });
+}
+
+const PROCESS_CLOSE_GRACE_MS = 1000;
+const PROCESS_TIMEOUT_SETTLEMENT_MS = 4000;
 
 function runProcessCaptured(command, args, options) {
   const timeoutMs = options.timeoutMs;
@@ -1585,15 +1727,19 @@ function runProcessCaptured(command, args, options) {
     const invocation = processInvocation(command, args);
     const child = spawn(invocation.command, invocation.args, {
       cwd: options.cwd,
-      env: { ...process.env, NO_COLOR: '1' },
+      env: options.env ?? { ...process.env, NO_COLOR: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     });
+    child.codexproKillTree = Boolean(invocation.killTree);
+    if (typeof options.onSpawn === 'function') options.onSpawn(child);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    let closed = false;
+    let settled = false;
+    let closeGraceTimer = null;
+    let timeoutSettlementTimer = null;
     const appendBounded = (current, chunk) => {
       if (Buffer.byteLength(current, 'utf8') > retainedOutputBytes) return current;
       const next = current + String(chunk);
@@ -1602,12 +1748,40 @@ function runProcessCaptured(command, args, options) {
         ? buffer.subarray(0, retainedOutputBytes).toString('utf8')
         : next;
     };
+    const finish = (exitCode, signal, completionSource, spawnError = false, spawnErrorMessage = '') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (closeGraceTimer) clearTimeout(closeGraceTimer);
+      if (timeoutSettlementTimer) clearTimeout(timeoutSettlementTimer);
+      if (completionSource !== 'close') {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref();
+      }
+      const out = trimBytes(stdout, maxOutputBytes);
+      const timeoutMessage = timedOut ? `\n[codexpro] Command timed out after ${timeoutMs} ms.` : '';
+      const errorText = spawnErrorMessage || `${stderr}${timeoutMessage}`;
+      const err = trimBytes(errorText, maxOutputBytes);
+      resolve({
+        exitCode,
+        signal,
+        durationMs: Date.now() - started,
+        timedOut,
+        stdout: spawnError ? '' : out.text,
+        stderr: err.text,
+        truncated: out.truncated || err.truncated,
+        spawnError,
+        completionSource
+      });
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        if (!closed) child.kill('SIGKILL');
-      }, 1500).unref();
+      killProcess(child);
+      timeoutSettlementTimer = setTimeout(() => {
+        finish(child.exitCode, child.signalCode, 'timeout-fallback');
+      }, PROCESS_TIMEOUT_SETTLEMENT_MS);
+      timeoutSettlementTimer.unref();
     }, timeoutMs);
     timer.unref();
 
@@ -1617,33 +1791,17 @@ function runProcessCaptured(command, args, options) {
     child.stderr.on('data', (chunk) => {
       stderr = appendBounded(stderr, chunk);
     });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: 127,
-        signal: null,
-        durationMs: Date.now() - started,
-        timedOut,
-        stdout: '',
-        stderr: error instanceof Error ? error.message : String(error),
-        spawnError: true
-      });
+    child.once('error', (error) => {
+      finish(127, null, 'spawn-error', true, error instanceof Error ? error.message : String(error));
     });
-    child.on('close', (exitCode, signal) => {
-      closed = true;
-      clearTimeout(timer);
-      const out = trimBytes(stdout, maxOutputBytes);
-      const err = trimBytes(`${stderr}${timedOut ? `\n[codexpro] Command timed out after ${timeoutMs} ms.` : ''}`, maxOutputBytes);
-      resolve({
-        exitCode,
-        signal,
-        durationMs: Date.now() - started,
-        timedOut,
-        stdout: out.text,
-        stderr: err.text,
-        truncated: out.truncated || err.truncated,
-        spawnError: false
-      });
+    child.once('exit', (exitCode, signal) => {
+      closeGraceTimer = setTimeout(() => {
+        finish(exitCode, signal, 'exit-fallback');
+      }, PROCESS_CLOSE_GRACE_MS);
+      closeGraceTimer.unref();
+    });
+    child.once('close', (exitCode, signal) => {
+      finish(exitCode, signal, 'close');
     });
   });
 }
@@ -1686,9 +1844,9 @@ function codeBlock(label, value) {
 function writeExecutionOutputs(root, contextDir, commandInfo, result, diffText, gitStatusText) {
   const bridgeDir = resolveWorkspaceFile(root, contextDir);
   fs.mkdirSync(bridgeDir, { recursive: true, mode: 0o700 });
-  const statusPath = path.join(bridgeDir, 'agent-status.md');
-  const diffPath = path.join(bridgeDir, 'implementation-diff.patch');
-  const logPath = path.join(bridgeDir, 'execution-log.jsonl');
+  const statusPath = resolveWorkspaceFile(root, path.join(contextDir, 'agent-status.md'));
+  const diffPath = resolveWorkspaceFile(root, path.join(contextDir, 'implementation-diff.patch'));
+  const logPath = resolveWorkspaceFile(root, path.join(contextDir, 'execution-log.jsonl'));
   const commandText = executorCommandPreview(commandInfo);
   const status = [
     '# Agent Execution Status',
@@ -1700,6 +1858,7 @@ function writeExecutionOutputs(root, contextDir, commandInfo, result, diffText, 
     `Exit code: ${result.exitCode ?? 'null'}`,
     result.signal ? `Signal: ${result.signal}` : '',
     `Timed out: ${result.timedOut ? 'yes' : 'no'}`,
+    `Completion: ${result.completionSource}`,
     `Duration: ${result.durationMs} ms`,
     `Diff path: ${path.posix.join(contextDir, 'implementation-diff.patch')}`,
     `Execution log: ${path.posix.join(contextDir, 'execution-log.jsonl')}`,
@@ -1720,6 +1879,7 @@ function writeExecutionOutputs(root, contextDir, commandInfo, result, diffText, 
     exit_code: result.exitCode,
     signal: result.signal,
     timed_out: result.timedOut,
+    completion_source: result.completionSource,
     duration_ms: result.durationMs,
     stdout_excerpt: result.stdout,
     stderr_excerpt: result.stderr,
@@ -1756,7 +1916,7 @@ function loadHandoffExecution(args) {
   const root = realDir(args.root ?? process.env.CODEXPRO_ROOT ?? process.cwd());
   const contextDir = contextDirFromArgs(args);
   const bridgeDir = resolveWorkspaceFile(root, contextDir);
-  const planPath = path.join(bridgeDir, 'current-plan.md');
+  const planPath = resolveWorkspaceFile(root, path.join(contextDir, 'current-plan.md'));
   const maxReadBytes = handoffMaxReadBytes();
   const maxOutputBytes = numberOption(args.maxOutputBytes ?? process.env.CODEXPRO_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000);
   const timeoutMs = numberOption(args.timeoutMs ?? args.timeout, 600_000, 1_000, 24 * 60 * 60_000);
@@ -1804,50 +1964,119 @@ async function executeHandoffRequest(request, args, options = {}) {
   const iteration = Number.isFinite(options.iteration) ? options.iteration : 1;
   const runPlanHash = planHash(request.planText);
   const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  const mutationGuard = handoffRemoteMutationEnvironment(args);
+  let activeChild = null;
+  let interruptedSignal = null;
+
+  const baseRunState = () => ({
+    iteration,
+    started_at: startedAt,
+    plan_hash: runPlanHash,
+    executor: request.commandInfo.agent,
+    model: request.commandInfo.model || undefined,
+    pid: process.pid,
+    child_pid: activeChild?.pid ?? null,
+    remote_mutations: mutationGuard.mode
+  });
+
+  const markInterrupted = (signal) => {
+    if (interruptedSignal) return;
+    interruptedSignal = signal;
+    try {
+      writeHandoffRunState(request.root, request.contextDir, {
+        state: 'interrupting',
+        ...baseRunState(),
+        interrupted_at: new Date().toISOString(),
+        finished_at: null,
+        exit_code: null,
+        timed_out: false,
+        interrupted_signal: signal,
+        duration_ms: Date.now() - startedMs,
+        reconcile_required: true,
+        execution_outcome: 'unknown'
+      });
+    } catch {}
+    if (activeChild) killProcess(activeChild);
+  };
+  const onSigint = () => markInterrupted('SIGINT');
+  const onSigterm = () => markInterrupted('SIGTERM');
+
   writeHandoffRunState(request.root, request.contextDir, {
     state: 'running',
-    iteration,
-    started_at: startedAt,
+    ...baseRunState(),
     finished_at: null,
-    plan_hash: runPlanHash,
-    executor: request.commandInfo.agent,
-    model: request.commandInfo.model || undefined,
-    pid: process.pid
+    reconcile_required: false
   });
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
 
-  statusLine('wait', `Running ${request.commandInfo.agent}: ${request.commandText}`);
-  const result = await runProcessCaptured(request.commandInfo.command, request.commandInfo.args, {
-    cwd: request.root,
-    timeoutMs: request.timeoutMs,
-    maxOutputBytes: request.maxOutputBytes
-  });
-  const diffText = readGitDiffExcludingContext(request.root, request.contextDir, request.maxOutputBytes);
-  const gitStatusText = readGitStatus(request.root, request.maxOutputBytes);
-  const outputs = writeExecutionOutputs(request.root, request.contextDir, request.commandInfo, result, diffText, gitStatusText);
+  try {
+    statusLine('wait', `Running ${request.commandInfo.agent}: ${request.commandText}`);
+    const result = await runProcessCaptured(request.commandInfo.command, request.commandInfo.args, {
+      cwd: request.root,
+      timeoutMs: request.timeoutMs,
+      maxOutputBytes: request.maxOutputBytes,
+      env: mutationGuard.env,
+      onSpawn: (child) => {
+        activeChild = child;
+        writeHandoffRunState(request.root, request.contextDir, {
+          state: 'running',
+          ...baseRunState(),
+          finished_at: null,
+          reconcile_required: false
+        });
+      }
+    });
+    const diffText = readGitDiffExcludingContext(request.root, request.contextDir, request.maxOutputBytes);
+    const gitStatusText = readGitStatus(request.root, request.maxOutputBytes);
+    const outputs = writeExecutionOutputs(request.root, request.contextDir, request.commandInfo, result, diffText, gitStatusText);
 
-  const runState = result.timedOut ? 'timed_out' : (result.exitCode === 0 ? 'completed' : 'failed');
-  const testsAbsPath = path.join(request.bridgeDir, 'loop-tests.txt');
-  writeHandoffRunState(request.root, request.contextDir, {
-    state: runState,
-    iteration,
-    started_at: startedAt,
-    finished_at: new Date().toISOString(),
-    plan_hash: runPlanHash,
-    executor: request.commandInfo.agent,
-    model: request.commandInfo.model || undefined,
-    exit_code: result.exitCode ?? null,
-    timed_out: Boolean(result.timedOut),
-    duration_ms: result.durationMs,
-    status_file: path.posix.join(request.contextDir, 'agent-status.md'),
-    diff_file: path.posix.join(request.contextDir, 'implementation-diff.patch'),
-    log_file: path.posix.join(request.contextDir, 'execution-log.jsonl'),
-    ...(fs.existsSync(testsAbsPath) ? { tests_file: path.posix.join(request.contextDir, 'loop-tests.txt') } : {})
-  });
-  statusLine(result.exitCode === 0 ? 'ok' : 'warn', `Agent exited with code ${result.exitCode ?? 'null'}${result.signal ? ` signal=${result.signal}` : ''}`);
-  console.log(`Status: ${path.relative(request.root, outputs.statusPath)}`);
-  console.log(`Diff:   ${path.relative(request.root, outputs.diffPath)}`);
-  console.log(`Log:    ${path.relative(request.root, outputs.logPath)}`);
-  return { cancelled: false, result, outputs };
+    const runState = interruptedSignal
+      ? 'interrupted'
+      : result.timedOut
+        ? 'timed_out'
+        : (result.exitCode === 0 ? 'completed' : 'failed');
+    const testsAbsPath = path.join(request.bridgeDir, 'loop-tests.txt');
+    writeHandoffRunState(request.root, request.contextDir, {
+      state: runState,
+      ...baseRunState(),
+      finished_at: new Date().toISOString(),
+      exit_code: result.exitCode ?? null,
+      timed_out: Boolean(result.timedOut),
+      completion_source: result.completionSource,
+      duration_ms: result.durationMs,
+      ...(interruptedSignal ? { interrupted_signal: interruptedSignal } : {}),
+      execution_outcome: runState === 'completed' ? 'completed' : 'unknown',
+      reconcile_required: runState !== 'completed',
+      status_file: path.posix.join(request.contextDir, 'agent-status.md'),
+      diff_file: path.posix.join(request.contextDir, 'implementation-diff.patch'),
+      log_file: path.posix.join(request.contextDir, 'execution-log.jsonl'),
+      ...(fs.existsSync(testsAbsPath) ? { tests_file: path.posix.join(request.contextDir, 'loop-tests.txt') } : {})
+    });
+    statusLine(result.exitCode === 0 && !interruptedSignal ? 'ok' : 'warn', `Agent exited with code ${result.exitCode ?? 'null'}${result.signal ? ` signal=${result.signal}` : ''}${interruptedSignal ? ` parent_signal=${interruptedSignal}` : ''}`);
+    console.log(`Status: ${path.relative(request.root, outputs.statusPath)}`);
+    console.log(`Diff:   ${path.relative(request.root, outputs.diffPath)}`);
+    console.log(`Log:    ${path.relative(request.root, outputs.logPath)}`);
+    return { cancelled: false, result, outputs, interruptedSignal };
+  } catch (error) {
+    writeHandoffRunState(request.root, request.contextDir, {
+      state: interruptedSignal ? 'interrupted' : 'failed',
+      ...baseRunState(),
+      finished_at: new Date().toISOString(),
+      exit_code: null,
+      timed_out: false,
+      duration_ms: Date.now() - startedMs,
+      ...(interruptedSignal ? { interrupted_signal: interruptedSignal } : {}),
+      reconcile_required: true,
+      execution_outcome: 'unknown'
+    });
+    throw error;
+  } finally {
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    mutationGuard.cleanup();
+  }
 }
 
 async function runExecuteHandoff(argv) {
@@ -1864,7 +2093,9 @@ async function runExecuteHandoff(argv) {
   }
 
   const execution = await executeHandoffRequest(request, args);
-  if (execution.result && execution.result.exitCode !== 0) process.exitCode = execution.result.exitCode ?? 1;
+  if (execution.interruptedSignal === 'SIGINT') process.exitCode = 130;
+  else if (execution.interruptedSignal === 'SIGTERM') process.exitCode = 143;
+  else if (execution.result && execution.result.exitCode !== 0) process.exitCode = execution.result.exitCode ?? 1;
 }
 
 function planHash(planText) {
@@ -2747,9 +2978,9 @@ function printConnectorBlock(endpoint, token, options = {}) {
   const details = createConnectorDetails(endpoint, token, options.localBase ?? '');
   const { serverUrl } = details;
   const publicHttps = serverUrl.startsWith('https://');
-  const shouldCopy = options.copyUrl === true || (options.copyUrl !== false && publicHttps);
+  const shouldCopy = !options.headless && (options.copyUrl === true || (options.copyUrl !== false && publicHttps));
   const copied = shouldCopy ? copyToClipboard(serverUrl) : { ok: false, command: '' };
-  const opened = options.openChatgpt ? openUrl(details.chatgptSettingsUrl) : false;
+  const opened = !options.headless && options.openChatgpt ? openUrl(details.chatgptSettingsUrl) : false;
 
   const mode = options.mode ?? 'agent';
   const modeTitle = mode === 'agent' ? 'Agent' : mode === 'handoff' ? 'Handoff' : 'Pro planning';
@@ -2773,7 +3004,7 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log('  URL        local HTTP only');
     console.log(serverUrl);
   }
-  if (options.openChatgpt) {
+  if (options.openChatgpt && !options.headless) {
     statusLine(opened ? 'ok' : 'warn', opened ? 'Opened ChatGPT connector settings' : 'Could not open ChatGPT automatically');
   }
   console.log('');
@@ -2788,8 +3019,12 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log('  POST /mcp -> 2xx The MCP connection reached CodexPro successfully.');
     console.log('');
   }
-  console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
-  console.log('Keys: Enter open | c copy | o status | h help | q quit');
+  if (options.headless) {
+    console.log(`CODEXPRO_READY ${serverUrl}`);
+  } else {
+    console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
+    console.log('Keys: Enter open | c copy | o status | h help | q quit');
+  }
   return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard' };
 }
 
@@ -3093,6 +3328,9 @@ function profileFromPreference(root, args, profile, preference) {
   const port = String(optionValue(args, profile, 'port', ['CODEXPRO_PORT'], '8787'));
   const bash = optionValue(args, profile, 'bash', ['CODEXPRO_BASH_MODE'], '');
   const bashTranscript = bashTranscriptOption(args, profile);
+  const bashRuntime = bashRuntimeOption(args, profile);
+  const bashExecutable = bashExecutableOption(args, profile);
+  const gitExecutable = gitExecutableOption(args, profile);
   const codexSessions = codexSessionsOption(args, profile);
   const codexDir = optionValue(args, profile, 'codexDir', ['CODEXPRO_CODEX_DIR'], '');
   const { bashSession, requireBashSession } = bashSessionOptions(args, profile);
@@ -3101,6 +3339,7 @@ function profileFromPreference(root, args, profile, preference) {
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], '');
   const existingToken = optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], '');
   const token = preference.tunnel === 'none' ? existingToken : stableToken(existingToken);
+  const allowedRoots = configuredProjectRoots(root, args, profile);
   return {
     port,
     mode,
@@ -3113,6 +3352,9 @@ function profileFromPreference(root, args, profile, preference) {
     ...(token ? { token } : {}),
     ...(bash ? { bash } : {}),
     ...(bashTranscript !== 'compact' ? { bashTranscript } : {}),
+    ...(bashRuntime !== 'auto' ? { bashRuntime } : {}),
+    ...(bashExecutable ? { bashExecutable } : {}),
+    ...(gitExecutable ? { gitExecutable } : {}),
     ...(codexSessions !== 'off' ? { codexSessions } : {}),
     ...(codexDir ? { codexDir } : {}),
     ...(bashSession ? { bashSession } : {}),
@@ -3121,13 +3363,14 @@ function profileFromPreference(root, args, profile, preference) {
     ...(toolMode ? { toolMode } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
+    ...(allowedRoots.length ? { allowedRoots } : {}),
     ...(args.noInstallCloudflared ? { noInstallCloudflared: true } : {}),
     root
   };
 }
 
 async function maybeConfigureFirstRun(root, args, profile) {
-  if (profile.profilePath || !process.stdin.isTTY || !process.stdout.isTTY || process.env.CI || hasExplicitTunnelInput(args)) {
+  if (profile.profilePath || args.headless || !process.stdin.isTTY || !process.stdout.isTTY || process.env.CI || hasExplicitTunnelInput(args)) {
     return profile;
   }
 
@@ -3327,6 +3570,7 @@ async function runSetupWizard(argv) {
     const saveAnswer = await ask(rl, 'Save this setup for future runs from this workspace?', saveDefault);
     const shouldSave = !['n', 'no'].includes(saveAnswer.trim().toLowerCase());
     if (shouldSave) {
+      const allowedRoots = configuredProjectRoots(root, defaults, profile);
       const savedPath = saveWorkspaceProfile(root, {
         port,
         mode,
@@ -3347,6 +3591,7 @@ async function runSetupWizard(argv) {
         ...(toolMode ? { toolMode } : {}),
         ...(widgetDomain ? { widgetDomain } : {}),
         ...toolCardsEntry,
+        ...(allowedRoots.length ? { allowedRoots } : {}),
         ...(defaults.noInstallCloudflared ? { noInstallCloudflared: true } : {})
       });
       statusLine('ok', `Saved workspace profile: ${savedPath}`);
@@ -3398,6 +3643,9 @@ function printProfile(root, profile) {
     ...(safe.codexDir ? [labelValue('Codex dir', safe.codexDir)] : []),
     ...(safe.bashSession ? [labelValue('Bash session', `${safe.bashSession}${safe.requireBashSession ? ' required' : ''}`)] : []),
     ...(safe.widgetDomain ? [labelValue('Widget origin', safe.widgetDomain)] : []),
+    ...(Array.isArray(safe.allowedRoots) && safe.allowedRoots.length
+      ? [labelValue('Projects', safe.allowedRoots.join(', '))]
+      : []),
     ...(safe.noInstallCloudflared ? [labelValue('cloudflared', 'manual install only')] : []),
     ...(safe.token ? [labelValue('Token', safe.token)] : []),
     ...(safe.cloudflareToken ? [labelValue('Cloudflare token', safe.cloudflareToken)] : [])
@@ -3455,6 +3703,7 @@ function saveSettingsFromArgs(root, args, profile) {
   const token = tunnel === 'none'
     ? optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], profile.token ?? '')
     : stableToken(optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], profile.token ?? ''));
+  const allowedRoots = configuredProjectRoots(root, args, profile);
   const savedPath = saveWorkspaceProfile(root, {
     port,
     mode,
@@ -3475,6 +3724,7 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(toolMode ? { toolMode } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
+    ...(allowedRoots.length ? { allowedRoots } : {}),
     ...(args.noInstallCloudflared ?? profile.noInstallCloudflared ? { noInstallCloudflared: true } : {})
   });
   statusLine('ok', `Saved workspace settings: ${savedPath}`);
@@ -3631,7 +3881,19 @@ function writeControlPrompt() {
 }
 
 function runControlPanel(details, cleanup = cleanupChildren) {
-  if (!process.stdin.isTTY) return new Promise(() => {});
+  if (!process.stdin.isTTY) {
+    process.stdin.setEncoding('utf8');
+    process.stdin.resume();
+    return new Promise(() => {
+      process.stdin.on('data', (input) => {
+        const normalized = String(input).trim().toLowerCase();
+        if (normalized === 'q') {
+          cleanup();
+          process.exit(0);
+        }
+      });
+    });
+  }
 
   writeControlPrompt();
 
@@ -3685,6 +3947,28 @@ function runControlPanel(details, cleanup = cleanupChildren) {
       }
     });
   });
+}
+
+function waitForUnexpectedRuntimeExit(server, cleanup = cleanupChildren) {
+  return new Promise((_, reject) => {
+    const fail = (code, signal, error) => {
+      cleanup();
+      const detail = error
+        ? error instanceof Error ? error.message : String(error)
+        : `code=${code ?? 'null'} signal=${signal ?? 'null'}`;
+      reject(new Error(`CodexPro HTTP runtime exited unexpectedly (${detail}).`));
+    };
+    if (server.exitCode !== null || server.signalCode !== null) {
+      fail(server.exitCode, server.signalCode);
+      return;
+    }
+    server.once('error', (error) => fail(null, null, error));
+    server.once('exit', (code, signal) => fail(code, signal));
+  });
+}
+
+function holdRuntime(server, details, cleanup, headless) {
+  return headless ? waitForUnexpectedRuntimeExit(server, cleanup) : runControlPanel(details, cleanup);
 }
 
 async function main() {
@@ -3772,6 +4056,7 @@ async function main() {
   }
   if (argv[0] === 'help') argv[0] = '--help';
   const args = parseArgs(argv);
+  const headless = Boolean(args.headless);
   if (connectionTest) {
     args.mode = 'agent';
     args.toolMode = 'standard';
@@ -3821,7 +4106,7 @@ async function main() {
     throw new Error('--mode must be agent, handoff, or pro');
   }
 
-  const allowRoots = [root, ...(args.allowRoots ?? [])].map(realDir);
+  const allowRoots = [root, ...configuredProjectRoots(root, args, profile)];
   const host = optionValue(args, profile, 'host', ['CODEXPRO_HOST'], '127.0.0.1');
   if (args.noAuth && (tunnel !== 'none' || !isLoopbackHost(host))) {
     throw new Error('--no-auth is only allowed with --tunnel none on a loopback host.');
@@ -3829,6 +4114,9 @@ async function main() {
   const port = String(optionValue(args, profile, 'port', ['CODEXPRO_PORT'], '8787'));
   const bash = optionValue(args, profile, 'bash', ['CODEXPRO_BASH_MODE'], 'safe');
   const bashTranscript = bashTranscriptOption(args, profile);
+  const bashRuntime = bashRuntimeOption(args, profile);
+  const bashExecutable = bashExecutableOption(args, profile);
+  const gitExecutable = gitExecutableOption(args, profile);
   const codexSessions = codexSessionsOption(args, profile);
   const codexDir = resolveCodexDir(root, optionValue(args, profile, 'codexDir', ['CODEXPRO_CODEX_DIR'], ''));
   const { bashSession, requireBashSession } = bashSessionOptions(args, profile);
@@ -3837,10 +4125,18 @@ async function main() {
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], 'https://rebel0789.github.io');
   const toolCards = optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false);
   validateChoice('bash', bash, ['off', 'safe', 'full']);
+  if (bashRuntime === 'wsl' && process.platform !== 'win32') {
+    throw new Error('--bash-runtime=wsl is only supported on Windows.');
+  }
   validateChoice('write', write, ['off', 'handoff', 'workspace']);
   validateChoice('tool-mode', toolMode, ['minimal', 'standard', 'full']);
 
-  let token = args.noAuth ? '' : optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], '');
+  if (args.token && args.tokenFile) throw new Error('Use either --token or --token-file, not both.');
+  let token = args.noAuth
+    ? ''
+    : args.tokenFile
+      ? readTokenFile(args.tokenFile)
+      : optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], '');
   if (!token && !args.noAuth) token = stableToken();
 
   const serverEnv = {
@@ -3851,6 +4147,9 @@ async function main() {
     CODEXPRO_PORT: port,
     CODEXPRO_BASH_MODE: bash,
     CODEXPRO_BASH_TRANSCRIPT: bashTranscript,
+    CODEXPRO_BASH_RUNTIME: bashRuntime,
+    CODEXPRO_BASH_EXECUTABLE: bashExecutable,
+    CODEXPRO_GIT_EXECUTABLE: gitExecutable,
     CODEXPRO_BASH_SESSION_ID: bashSession,
     CODEXPRO_REQUIRE_BASH_SESSION: requireBashSession ? '1' : '0',
     CODEXPRO_CODEX_SESSIONS: codexSessions,
@@ -3882,8 +4181,10 @@ async function main() {
 
   printBox('CodexPro start', [
     labelValue('Workspace', root),
+    ...(allowRoots.length > 1 ? [labelValue('Projects', allowRoots.slice(1).join(', '))] : []),
     labelValue('Mode', `${mode}  tools=${toolMode}  write=${write}  bash=${bash}`),
     labelValue('Bash transcript', bashTranscript),
+    labelValue('Bash runtime', `${bashRuntime}${bashExecutable ? ` (${bashExecutable})` : ''}`),
     labelValue('Codex sessions', codexSessions),
     ...(bashSession ? [labelValue('Bash session', `${bashSession}${requireBashSession ? ' required' : ''}`)] : []),
     labelValue('Local URL', `http://${host}:${port}/mcp`),
@@ -3929,7 +4230,8 @@ async function main() {
     bashSession,
     requireBashSession,
     toolCards,
-    connectionTest
+    connectionTest,
+    runtimePid: server.pid ?? null
   };
 
   if (tunnel === 'none') {
@@ -3939,6 +4241,7 @@ async function main() {
     }
     const details = printConnectorBlock(`${localBase}/mcp`, token, {
       localBase,
+      headless,
       copyUrl: args.copyUrl ? true : args.noCopyUrl ? false : undefined,
       openChatgpt: Boolean(args.openChatgpt),
       mode,
@@ -3953,7 +4256,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await runControlPanel(details, cleanup);
+    await holdRuntime(server, details, cleanup, headless);
     return;
   }
 
@@ -3983,6 +4286,7 @@ async function main() {
     }
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
+      headless,
       copyUrl: args.noCopyUrl ? false : true,
       openChatgpt: Boolean(args.openChatgpt),
       mode,
@@ -3997,7 +4301,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await runControlPanel(details, cleanup);
+    await holdRuntime(server, details, cleanup, headless);
     return;
   }
 
@@ -4028,6 +4332,7 @@ async function main() {
     }
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
+      headless,
       copyUrl: args.noCopyUrl ? false : true,
       openChatgpt: Boolean(args.openChatgpt),
       mode,
@@ -4042,7 +4347,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await runControlPanel(details, cleanup);
+    await holdRuntime(server, details, cleanup, headless);
     return;
   }
 
@@ -4053,6 +4358,7 @@ async function main() {
     console.error('Downloads: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/');
     const details = printConnectorBlock(`${localBase}/mcp`, token, {
       localBase,
+      headless,
       copyUrl: args.copyUrl ? true : false,
       openChatgpt: Boolean(args.openChatgpt),
       mode,
@@ -4067,7 +4373,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await runControlPanel(details, cleanup);
+    await holdRuntime(server, details, cleanup, headless);
     return;
   }
 
@@ -4096,6 +4402,7 @@ async function main() {
     }
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
+      headless,
       copyUrl: args.noCopyUrl ? false : true,
       openChatgpt: Boolean(args.openChatgpt),
       mode,
@@ -4110,7 +4417,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await runControlPanel(details, cleanup);
+    await holdRuntime(server, details, cleanup, headless);
     return;
   }
 
@@ -4165,6 +4472,7 @@ async function main() {
   }
   const details = printConnectorBlock(`${publicBase}/mcp`, token, {
     localBase,
+    headless,
     copyUrl: args.noCopyUrl ? false : true,
     openChatgpt: Boolean(args.openChatgpt),
     mode,
@@ -4179,7 +4487,7 @@ async function main() {
     connectionTest
   });
   saveRuntimeConnection(root, details, runtimeOptions);
-  await runControlPanel(details, cleanup);
+  await holdRuntime(server, details, cleanup, headless);
 }
 
 main().catch((error) => {

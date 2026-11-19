@@ -5,8 +5,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = "1";
+
 const root = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const npmCli = process.env.npm_execpath;
 const manifest = JSON.parse(await (await import("node:fs/promises")).readFile(join(root, "package.json"), "utf8"));
 
 assert.equal(manifest.scripts.prepublishOnly, "node scripts/release-guard.mjs");
@@ -37,7 +40,10 @@ try {
   assert.notEqual(wrongDirectory.status, 0, wrongDirectory.output);
   assert.match(wrongDirectory.output, /Release commands must run from the CodexPro root/);
 
-  const prefixInvocation = run(npm, ["--prefix", root, "run", "release:guard", "--silent"], { cwd: wrongCwd });
+  const prefixArgs = ["--prefix", root, "run", "release:guard", "--silent"];
+  const prefixInvocation = npmCli
+    ? run(process.execPath, [npmCli, ...prefixArgs], { cwd: wrongCwd })
+    : run(npm, prefixArgs, { cwd: wrongCwd });
   assert.notEqual(prefixInvocation.status, 0, prefixInvocation.output);
   assert.match(prefixInvocation.output, /Release commands must run from the CodexPro root/);
 

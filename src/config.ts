@@ -5,9 +5,12 @@ import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.j
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
+export type BashRuntime = "auto" | "native-bash" | "wsl";
 export type CodexSessionsMode = "off" | "metadata" | "read";
 export type WriteMode = "off" | "handoff" | "workspace";
 export type ToolMode = "minimal" | "standard" | "full";
+export const MIN_HTTP_TOKEN_BYTES = 24;
+export const MAX_BASH_TIMEOUT_MS = 900_000;
 
 export interface CodexProConfig {
   defaultRoot: string;
@@ -19,16 +22,22 @@ export interface CodexProConfig {
   requireHttpToken: boolean;
   bashMode: BashMode;
   bashTranscript: BashTranscriptMode;
+  bashRuntime: BashRuntime;
+  bashExecutable?: string;
+  gitExecutable?: string;
   bashSessionId?: string;
   requireBashSession: boolean;
   codexSessions: CodexSessionsMode;
   codexDir: string;
   writeMode: WriteMode;
   toolMode: ToolMode;
+  exposeAbsolutePaths: boolean;
   inheritEnv: boolean;
   maxReadBytes: number;
   maxWriteBytes: number;
   maxOutputBytes: number;
+  maxBashTimeoutMs: number;
+  maxImportBytes: number;
   maxSearchResults: number;
   maxHttpSessions: number;
   httpSessionTtlMs: number;
@@ -150,7 +159,7 @@ function toRealDir(input: string): string {
   if (!stat.isDirectory()) {
     throw new Error(`Not a directory: ${resolved}`);
   }
-  return fs.realpathSync(resolved);
+  return fs.realpathSync.native(resolved);
 }
 
 function numberFrom(value: string | undefined, fallback: number, min: number, max: number): number {
@@ -167,6 +176,16 @@ function bashModeFrom(value: string | undefined): BashMode {
 function bashTranscriptFrom(value: string | undefined): BashTranscriptMode {
   if (value === "compact" || value === "full") return value;
   return "compact";
+}
+
+function bashRuntimeFrom(value: string | undefined): BashRuntime {
+  if (value === "auto" || value === "native-bash" || value === "wsl") return value;
+  return "auto";
+}
+
+function bashExecutableFrom(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
 }
 
 function codexSessionsFrom(value: string | undefined): CodexSessionsMode {
@@ -276,6 +295,9 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const hostArg = typeof args.host === "string" ? args.host : undefined;
   const bashArg = typeof args.bash === "string" ? args.bash : undefined;
   const bashTranscriptArg = typeof args["bash-transcript"] === "string" ? args["bash-transcript"] : undefined;
+  const bashRuntimeArg = typeof args["bash-runtime"] === "string" ? args["bash-runtime"] : undefined;
+  const bashExecutableArg = typeof args["bash-executable"] === "string" ? args["bash-executable"] : undefined;
+  const gitExecutableArg = typeof args["git-executable"] === "string" ? args["git-executable"] : undefined;
   const bashSessionArg = typeof args["bash-session"] === "string" ? args["bash-session"] : undefined;
   const codexSessionsArg = typeof args["codex-sessions"] === "string" ? args["codex-sessions"] : undefined;
   const codexDirArg = typeof args["codex-dir"] === "string" ? args["codex-dir"] : undefined;
@@ -297,6 +319,12 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const extraBlockedGlobs = splitList(process.env.CODEXPRO_BLOCKED_GLOBS, ",");
   const host = hostArg ?? process.env.CODEXPRO_HOST ?? process.env.HOST ?? "127.0.0.1";
   const authToken = process.env.CODEXPRO_HTTP_TOKEN ?? process.env.CODEBASE_BRIDGE_HTTP_TOKEN;
+  if (authToken && Buffer.byteLength(authToken, "utf8") < MIN_HTTP_TOKEN_BYTES) {
+    throw new Error(
+      `CODEXPRO_HTTP_TOKEN must be at least ${MIN_HTTP_TOKEN_BYTES} bytes. ` +
+      "Use `codexpro start` to generate a strong token."
+    );
+  }
   const allowNoToken = boolFrom(process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN, false) && isLoopbackHost(host);
   const requireHttpToken =
     (!authToken && !allowNoToken) ||
@@ -319,16 +347,23 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     requireHttpToken,
     bashMode: bashModeFrom(bashArg ?? process.env.CODEXPRO_BASH_MODE),
     bashTranscript: bashTranscriptFrom(bashTranscriptArg ?? process.env.CODEXPRO_BASH_TRANSCRIPT),
+    bashRuntime: bashRuntimeFrom(bashRuntimeArg ?? process.env.CODEXPRO_BASH_RUNTIME),
+    bashExecutable: bashExecutableFrom(bashExecutableArg ?? process.env.CODEXPRO_BASH_EXECUTABLE),
+    gitExecutable: bashExecutableFrom(gitExecutableArg ?? process.env.CODEXPRO_GIT_EXECUTABLE),
     bashSessionId,
     requireBashSession,
     codexSessions: codexSessionsFrom(codexSessionsArg ?? process.env.CODEXPRO_CODEX_SESSIONS),
     codexDir: expandHome(codexDirArg || process.env.CODEXPRO_CODEX_DIR || path.join(os.homedir(), ".codex")),
     writeMode: writeModeFrom(writeArg ?? process.env.CODEXPRO_WRITE_MODE),
     toolMode: toolModeFrom(toolModeArg ?? process.env.CODEXPRO_TOOL_MODE),
+    exposeAbsolutePaths: boolFrom(process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS, false),
     inheritEnv: process.env.CODEXPRO_INHERIT_ENV === "1",
     maxReadBytes: numberFrom(process.env.CODEXPRO_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
     maxWriteBytes: numberFrom(process.env.CODEXPRO_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),
     maxOutputBytes: numberFrom(process.env.CODEXPRO_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
+    // Default hard cap is 10 minutes. Operators can raise up to 15 minutes.
+    maxBashTimeoutMs: numberFrom(process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS, 600_000, 1_000, MAX_BASH_TIMEOUT_MS),
+    maxImportBytes: numberFrom(process.env.CODEXPRO_MAX_IMPORT_BYTES, 5_000_000, 1_000, 50_000_000),
     maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
     maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
     httpSessionTtlMs: numberFrom(process.env.CODEXPRO_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),

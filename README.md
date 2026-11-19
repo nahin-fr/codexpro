@@ -5,7 +5,7 @@
 <h1 align="center">CodexPro</h1>
 
 <p align="center">
-  Local coding tools for ChatGPT, scoped to one repo.
+  Give ChatGPT local coding tools for repos you explicitly allow.
 </p>
 
 <p align="center">
@@ -15,37 +15,37 @@
   <a href="https://rebel0789.github.io/codexpro/"><img alt="Website" src="https://img.shields.io/badge/site-GitHub%20Pages-67e8f9?style=flat-square"></a>
 </p>
 
+## What it is
+
+CodexPro is a local MCP server. It connects **your ChatGPT session** to **your machine** and **repos you allow**.
+
+ChatGPT can read, search, edit, review, verify, import attachments, and write handoff plans. It stays inside those roots.
+
+It is not a hosted SaaS product, model proxy, quota bypass, account pool, or remote shell service.
+
 ## Install
 
-Requirements:
+Needs:
 
 - Node.js 20+
-- A ChatGPT account with Apps / Developer Mode access
-- One HTTPS route to your local machine when connecting ChatGPT from the web
-
-Install the CLI:
+- A ChatGPT account that can create custom MCP plugins
+- An HTTPS URL to your machine for ChatGPT web (tunnel or Tailscale Funnel)
 
 ```bash
 npm install -g codexpro
-```
-
-Run setup inside the repo you want ChatGPT to work on:
-
-```bash
 cd /path/to/your/repo
 codexpro setup
 ```
 
-CodexPro prints and copies the Server URL. In ChatGPT, open:
+## Connect in ChatGPT
 
-```text
-Settings -> Security and login -> Developer mode: on
-Settings -> Plugins -> Plugins tab -> + (beside Search plugins)
-```
+1. `Settings -> Security and login` → turn **Developer mode** on (keep CSP enforcement on).
+2. `Settings -> Plugins` → Plugins tab → **+** beside Search plugins.
+3. Create a plugin named `CodexPro`.
+4. Connection: **Server URL** → paste the URL CodexPro copied.
+5. Authentication: **No Authentication / None** (change this if the form defaults to OAuth).
 
-This opens **New Plugin**. Give it a name such as `CodexPro`, paste the Server URL in the **Server URL** connection option, then choose `Authentication: No Authentication / None`. The form may initially show OAuth; change it before creating the plugin. CodexPro uses its own URL token.
-
-### Current Plugins UI
+CodexPro auth is the token already in that URL. Do not share the URL.
 
 | Open Plugins and click `+` | Complete the New Plugin form |
 | --- | --- |
@@ -57,48 +57,64 @@ Daily use from the same repo:
 codexpro start
 ```
 
-## What It Does
+If plugin creation fails, run `codexpro connection-test` and check whether ChatGPT requests reach the local server.
 
-CodexPro starts a local MCP server for the current workspace. ChatGPT can then:
+## What ChatGPT can do
 
-- read files and inspect the repo
-- search code
-- make scoped edits with `write`, `edit`, or guarded `apply_patch`
-- run safe verification commands through `bash`
-- review changed files with `show_changes`
-- write handoff plans under `.ai-bridge`
-- export a selected context bundle for model surfaces that cannot call tools
+With workspace write mode (the normal agent setup):
 
-CodexPro is not a hosted service, model proxy, quota bypass, account pool, or OS sandbox.
-It connects your own ChatGPT session to your own local repo through the official Developer Mode / MCP app path.
+- read, search, and inspect the repo with bounded code intelligence
+- edit with `write`, `edit`, or guarded `apply_patch`
+- import ChatGPT attachments with `import_file`
+- run allowlisted checks with `bash`
+- review diffs and likely impact with `show_changes`
+- write plans under `.ai-bridge`
+- export a context bundle for chats that cannot call tools
 
-## Repository Analysis
+### Built-in repository intelligence
 
-CodexPro builds a bounded repository map from local manifests, source declarations, imports, tests, and Git state. It provides:
+CodexPro does more than raw file search:
 
-- `inspect_workspace` for languages, project types, entrypoints, areas, symbols, and relationships
-- optional structured `search` intents: `text`, `symbol`, `references`, and `impact`
-- affected-area, risk, related-test, and focused-command recommendations in `show_changes`
-- matching read-only terminal views:
+- `inspect_workspace` maps languages, project types, entrypoints, areas, symbols, and internal relationships.
+- `search` supports targeted `symbol`, `references`, and `impact` intents as well as ordinary text and regex search.
+- `show_changes` identifies affected areas, likely dependents, related tests, risk signals, and relevant verification commands.
+- TypeScript/JavaScript, Python, Go, Rust, Swift, Java, C#, C, and C++ declarations are recognized. Other languages retain safe inventory and lexical search.
+
+Analysis is local, bounded, and cached by a workspace fingerprint. It needs no model API key, language-server daemon, embedding service, or vector database. Coverage and inference strength are reported instead of presented as certainty.
+
+### Product focus
+
+CodexPro is optimized for a narrow loop: connect ChatGPT to explicitly allowed local repositories, make a reviewable change, verify it, and preserve a handoff record. The project prioritizes:
+
+- explicit workspace boundaries and separate controls for reads, writes, commands, sessions, and handoffs
+- useful code navigation without sending a repository to a separate indexing service
+- cross-platform installation and release checks on supported Node.js versions
+- compact, bounded tool results that remain usable in long ChatGPT sessions
+
+See the [roadmap](ROADMAP.md) for the next reliability, code-navigation, and workflow improvements.
+
+## Multiple projects
+
+One CodexPro process can allow more than one repo:
 
 ```bash
-codexpro inspect --root /path/to/repo
-codexpro review --root /path/to/repo
-codexpro inspect --root /path/to/repo --json
+codexpro settings set --project ~/code/web --project ~/code/api
+codexpro settings show
+codexpro start
 ```
 
-The analysis is deterministic and local. It uses confidence labels instead of claiming compiler precision, stays within configured file/byte/symbol limits, and falls back to normal lexical search and Git review when analysis is incomplete.
+Ask ChatGPT to `open_workspace` on an allowed project. `open_current_workspace` returns to the launch repo.
 
-Set `CODEXPRO_ANALYSIS=0` to disable repository analysis without changing the rest of the connector.
+For two ChatGPT accounts or hard isolation, run two CodexPro processes on different ports and Server URLs.
 
-## Normal Commands
+## Commands
 
 ```bash
 codexpro setup
 codexpro start
 codexpro start --root /path/to/repo
 codexpro doctor
-codexpro connection-test --root /path/to/repo
+codexpro connection-test
 codexpro settings
 codexpro inspect
 codexpro review
@@ -112,63 +128,46 @@ codexpro start --tool-mode minimal
 codexpro start --tool-mode full
 codexpro start --mode handoff
 codexpro start --mode pro
+codexpro start --headless
 ```
 
-If ChatGPT cannot create the plugin, run `codexpro connection-test`. It keeps
-the normal read, tree, search, and skill tools, disables writes, bash, and tool
-cards, and logs whether a request reached the local MCP endpoint.
-
-Tool cards are opt in:
+Opt-in tool cards:
 
 ```bash
 CODEXPRO_TOOL_CARDS=1 codexpro start
 ```
 
-The v10 cards cover selected workspace, analysis, change, Git, handoff, and
-terminal results. Reads and searches stay in normal chat output. After updating
-the connector, refresh its ChatGPT plugin connection once so it loads the new
-widget resource.
+## Public HTTPS options
 
-## Public URL Options
-
-ChatGPT web needs a public HTTPS Server URL. CodexPro supports:
-
-- Fast demo URL: `codexpro start --tunnel cloudflare`
-- Stable ngrok domain: `codexpro ngrok --hostname your-domain.ngrok-free.dev`
-- Stable Cloudflare route: `codexpro stable --hostname codexpro.example.com --tunnel-name codexpro`
-- Tailscale Funnel: `codexpro tailscale --hostname your-device.your-tailnet.ts.net`
-- Local only: `codexpro start --tunnel none`
-
-Cloudflare quick tunnels honor `HTTPS_PROXY`, `ALL_PROXY`, or `HTTP_PROXY` when those env vars are set.
-
-Stable modes should use a stable CodexPro token:
+ChatGPT web needs HTTPS:
 
 ```bash
-codexpro tailscale \
-  --hostname your-device.your-tailnet.ts.net \
-  --token keep-this-token-stable
+codexpro start --tunnel cloudflare          # quick demo URL (changes)
+codexpro ngrok --hostname your.ngrok-free.dev
+codexpro stable --hostname codexpro.example.com --tunnel-name codexpro
+codexpro tailscale --hostname your-device.your-tailnet.ts.net
+codexpro start --tunnel none                # local only
 ```
 
-Tailscale Funnel must already be allowed for your tailnet. It requires MagicDNS, HTTPS certificates, and Funnel policy support. CodexPro runs:
+Keep a stable token for stable hostnames:
 
 ```bash
-tailscale funnel http://127.0.0.1:8787
+mkdir -p ~/.codexpro
+openssl rand -hex 32 > ~/.codexpro/http-token
+chmod 600 ~/.codexpro/http-token
 ```
 
-Then ChatGPT uses:
+Prefer `Authorization: Bearer <token>` when the client supports headers. The `?codexpro_token=` query form is a personal compatibility fallback.
 
-```text
-https://your-device.your-tailnet.ts.net/mcp?codexpro_token=keep-this-token-stable
-```
+## Safety defaults
 
-## Safety Defaults
+- Public tunnels require a CodexPro HTTP token (min 24 bytes)
+- Writes stay hidden unless write mode is `workspace`
+- Safe bash is the default
+- Blocked paths cover `.env`, keys, `.git`, build caches, and similar
+- Attachment import only accepts ChatGPT Apps SDK file objects from approved HTTPS hosts
 
-- Public tunnel mode requires a CodexPro HTTP token.
-- Generic writes are hidden unless `CODEXPRO_WRITE_MODE=workspace`.
-- Safe bash blocks broad shell patterns and secret/build/cache paths.
-- `apply_patch` is workspace-scoped and rejects blocked paths, symlink patches, and secret-looking patch content.
-- `show_changes` keeps a review checkpoint so repeated unchanged reviews collapse.
-- Tool-card metadata is off unless `CODEXPRO_TOOL_CARDS=1`.
+Read [SECURITY.md](SECURITY.md) before exposing a tunnel.
 
 ## Guarded Git and pull requests
 
@@ -178,74 +177,14 @@ Handoff mode uses separate `CODEXPRO_HANDOFF_GIT_*` flags and limits stage/unsta
 
 Read [SECURITY.md](SECURITY.md) before exposing CodexPro through any tunnel.
 
-## RAM And ChatGPT Memory
-
-CodexPro can reduce what it sends to ChatGPT. Current local fixes:
-
-- binary-file checks scan with a reusable 64 KiB buffer instead of allocating the whole file
-- ChatGPT tool-card structured payloads are compacted only for card output, not for normal tool data
-- bash chat transcripts stay compact by default
-
-That helps avoid oversized MCP/card payloads. It does not force Chrome, ChatGPT, or an old browser iframe to release memory that the client already holds. If the browser tab has already grown, reload the ChatGPT page or restart the browser.
-
-## Repo Context
-
-CodexPro uses explicit files, not hidden chat memory:
-
-```text
-AGENTS.md
-.ai-bridge/current-plan.md
-.ai-bridge/agent-status.md
-.ai-bridge/decisions.md
-.ai-bridge/open-questions.md
-.ai-bridge/execution-log.jsonl
-```
-
-For non-tool model surfaces:
+## Update
 
 ```bash
-codexpro start --mode pro
+npm install -g codexpro@latest
+codexpro --version
 ```
 
-Or from a local checkout:
-
-```bash
-codexpro pro-bundle --root /path/to/repo --copy
-codexpro pro-apply --root /path/to/repo --file plan.md
-```
-
-## Handoff
-
-ChatGPT can write a plan without executing a local agent:
-
-```bash
-codexpro start --mode handoff
-```
-
-Then you run execution locally:
-
-```bash
-codexpro execute-handoff --agent codex --yes
-codexpro watch-handoff --agent codex --yes
-```
-
-`handoff_to_agent` is planning-only over MCP. CodexPro does not expose arbitrary local agent execution as a remote ChatGPT tool.
-
-## Troubleshooting
-
-Run:
-
-```bash
-codexpro doctor
-```
-
-Common fixes:
-
-- Quick tunnel URL changed: rerun `codexpro start` and update the ChatGPT app Server URL.
-- Stable URL does not respond: check the tunnel provider first, then the CodexPro token.
-- ChatGPT cannot call tools in one model/chat: switch to a ChatGPT surface that supports Developer Mode app actions.
-- Local port is busy: start another repo with `--port 8788`.
-- Tool list looks stale: create a new ChatGPT app entry or change the connector URL token.
+Restart `codexpro start` after updating. Saved profiles under `~/.codexpro` stay in place.
 
 ## Development
 
@@ -254,19 +193,11 @@ npm install
 npm run build
 npm run smoke
 npm run stress
-```
-
-Useful release checks:
-
-```bash
+npm run package:smoke
 npm run release:check
-git diff --check
 ```
 
-Release only from the CodexPro project root. Do not use `npm --prefix` with
-`npm pack` or `npm publish`: npm packs the current directory in that case.
-The release scripts verify the root, package identity, canonical repository,
-and tarball before publishing:
+Publish only from the CodexPro root:
 
 ```bash
 cd /path/to/codexpro
@@ -278,5 +209,7 @@ npm run release:publish
 - [Website](https://rebel0789.github.io/codexpro/)
 - [FAQ](FAQ.md)
 - [Security](SECURITY.md)
+- [Roadmap](ROADMAP.md)
 - [Stable URL guide](DOMAIN_SETUP.md)
 - [Changelog](CHANGELOG.md)
+- [Contributors](CONTRIBUTORS.md)
